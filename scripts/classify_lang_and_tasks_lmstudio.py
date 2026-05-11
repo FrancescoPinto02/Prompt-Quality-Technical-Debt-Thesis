@@ -155,8 +155,8 @@ def call_lmstudio(
     model: str,
     prompt: str,
     temperature: float = 0.0,
-    max_tokens: int = 512,
-    timeout: int = 120,
+    max_tokens: int = 2048,
+    timeout: int = 180,
 ) -> str:
     """
     Calls LM Studio using the OpenAI-compatible /v1/chat/completions endpoint.
@@ -180,7 +180,22 @@ def call_lmstudio(
     response.raise_for_status()
 
     data = response.json()
-    return data["choices"][0]["message"]["content"]
+    choice = data["choices"][0]
+    message = choice["message"]
+
+    content = message.get("content") or ""
+
+    if not content.strip():
+        reasoning = message.get("reasoning_content", "")
+        finish_reason = choice.get("finish_reason")
+
+        raise ValueError(
+            "LM Studio returned empty content. "
+            f"finish_reason={finish_reason}. "
+            f"reasoning_preview={reasoning[:800]}"
+        )
+
+    return content
 
 
 def extract_json_object(text: str) -> Dict[str, Any]:
@@ -372,6 +387,8 @@ def classify_single_row(
     lmstudio_model: str,
     max_messages: int,
     retries: int,
+    max_tokens: int,
+    timeout: int,
 ) -> Dict[str, Any]:
     conversation_id = safe_json_serializable(row.get("conversation_id", None))
 
@@ -421,6 +438,8 @@ def classify_single_row(
                 api_base=api_base,
                 model=lmstudio_model,
                 prompt=final_prompt,
+                max_tokens=max_tokens,
+                timeout=timeout,
             )
 
             parsed = extract_json_object(raw_response)
@@ -466,6 +485,8 @@ def classify_parquet_file_parallel(
     max_messages: int = 2,
     workers: int = 2,
     retries: int = 2,
+    max_tokens: int = 2048,
+    timeout: int = 180,
 ) -> None:
     print(f"\nReading: {parquet_path}")
     df = pd.read_parquet(parquet_path)
@@ -509,6 +530,8 @@ def classify_parquet_file_parallel(
                 lmstudio_model,
                 max_messages,
                 retries,
+                max_tokens,
+                timeout,
             ): row_index
             for row_index, row in rows_to_process
         }
@@ -534,6 +557,8 @@ def classify_parquet_file(
     max_messages: int = 2,
     sleep_seconds: float = 0.0,
     retries: int = 2,
+    max_tokens: int = 2048,
+    timeout: int = 180,
 ) -> None:
     print(f"\nReading: {parquet_path}")
     df = pd.read_parquet(parquet_path)
@@ -601,6 +626,8 @@ def classify_parquet_file(
                     api_base=api_base,
                     model=lmstudio_model,
                     prompt=final_prompt,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
                 )
 
                 parsed = extract_json_object(raw_response)
@@ -717,6 +744,19 @@ def main():
         default=1,
         help="Number of parallel requests to LM Studio. Use 1 for sequential processing.",
     )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=2048,
+        help="Maximum number of completion tokens for each LM Studio request.",
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=180,
+        help="HTTP timeout in seconds for each LM Studio request.",
+    )
 
     args = parser.parse_args()
 
@@ -747,6 +787,8 @@ def main():
                 max_messages=args.max_messages,
                 sleep_seconds=args.sleep_seconds,
                 retries=args.retries,
+                max_tokens=args.max_tokens,
+                timeout=args.timeout,
             )
         else:
             classify_parquet_file_parallel(
@@ -759,6 +801,8 @@ def main():
                 max_messages=args.max_messages,
                 workers=args.workers,
                 retries=args.retries,
+                max_tokens=args.max_tokens,
+                timeout=args.timeout,
             )
 
 
