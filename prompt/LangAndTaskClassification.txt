@@ -3,8 +3,13 @@ You are an expert annotator for an empirical software engineering study on devel
 
 ####### TASK #######
 Classify the high-level task requested by the user and detect the natural language used by the user.
-Classify the task primarily from the user's intent. Use the assistant response only as auxiliary context when the user's request is unclear.
-For language detection, consider only the user's natural-language text. Ignore code blocks, inline code, stack traces, error logs, JSON, XML, YAML, HTML, SQL, shell commands, file paths, URLs, package names, API names, identifiers, function names, class names, variable names, and programming keywords.
+You will receive:
+- the natural-language portion of the user's prompt, after code-like content has been removed;
+- metadata indicating whether the original prompt contained code-like content.
+
+Classify the task primarily from the user's intent expressed in the natural-language text.
+Use the metadata only as auxiliary context.
+Do not infer task category from code content, because code-like content has been intentionally removed to avoid bias.
 
 ####### TASK CATEGORIES #######
 Use exactly one task_category from the following list:
@@ -13,16 +18,16 @@ Use exactly one task_category from the following list:
 - BUG_FIXING: The user asks to fix an error, bug, exception, failing behavior, or incorrect implementation.
 - REFACTORING: The user asks to improve code structure, readability, maintainability, performance, organization, or design without mainly changing functionality.
 - TEST_GENERATION: The user asks to create tests, unit tests, integration tests, mocks, or test cases.
-- EXPLANATION: The user asks for explanations, tutorials, educational examples, conceptual answers, or asks how/why something works. Code may appear, but the main goal is explanation or learning.
+- EXPLANATION: The user asks for explanations, tutorials, educational examples, conceptual answers, or asks how/why something works.
 - CONFIGURATION: The user asks for configuration, DevOps, deployment, build files, Docker, CI/CD, Kubernetes, package managers, shell commands, environment setup, or similar operational artifacts.
 - DATA_QUERY: The user asks for SQL queries, database queries, dataframe operations, analytics code, data processing logic, or data transformation logic.
 - OTHER: The request does not fit the categories above, including greetings, thanks, social interaction, non-software requests, or unrelated requests.
-- AMBIGUOUS: The task cannot be determined from the available conversation.
+- AMBIGUOUS: The task cannot be determined from the available text.
 
 ####### CODE GENERATION LABEL #######
 Set is_code_generation to true only if the user's main request is to produce, modify, fix, refactor, test, configure, query, or generate code or code-like technical artifacts as the expected deliverable.
 Set is_code_generation to false if the request is mainly explanatory, conceptual, tutorial-oriented, social, non-software, unrelated, or ambiguous.
-Do not set is_code_generation to true only because the assistant includes code examples. The user's intent is the main criterion.
+Do not set is_code_generation to true only because the metadata says that the original prompt contained code. The user's intent is the main criterion.
 
 ####### LANGUAGE DETECTION #######
 For detected_language, use ISO 639-1 language codes in Uppercase when possible, for example:
@@ -37,9 +42,8 @@ For detected_language, use ISO 639-1 language codes in Uppercase when possible, 
 - PT for Portuguese
 - KO for Korean
 
-Use UNKNOWN if the user's natural language cannot be determined reliably, for example when the user text contains only code.
+Use UNKNOWN if the user's natural language cannot be determined reliably.
 Use MIXED if multiple natural languages are present and no dominant language can be identified.
-
 
 ####### OUTPUT #######
 Return only valid JSON. Do not include comments, markdown, explanations, or extra text.
@@ -51,10 +55,8 @@ The JSON must have exactly this format:
   "code_generation_confidence": "HIGH | MEDIUM | LOW",
   "detected_language": "...",
   "language_confidence": "HIGH | MEDIUM | LOW",
-  "short_reason": "One concise sentence explaining the task and language classification in English."
+  "short_reason": "One concise English sentence explaining the task and language classification."
 }
 
-Always write the short_reason in English. Do not write the short_reason in the user's language.
-
-####### CONVERSATION TO CLASSIFY #######
+####### INPUT TO CLASSIFY #######
 
