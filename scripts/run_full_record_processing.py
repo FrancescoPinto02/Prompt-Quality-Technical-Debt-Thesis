@@ -148,18 +148,9 @@ def load_processed_keys(output_path: Path) -> Set[str]:
 
 def get_processing_key(parquet_name: str, row_index: Any, row: pd.Series) -> str:
     """
-    Computes the stable processing key for a record.
-
-    Priority:
-    1. prompt_hash, for deduplicated datasets;
-    2. conversation_id, for raw datasets;
-    3. source file + row index fallback.
+    Computes the stable processing key for a filtered record.
     """
-    prompt_hash = safe_json_serializable(row.get("prompt_hash", None))
     conversation_id = safe_json_serializable(row.get("conversation_id", None))
-
-    if prompt_hash is not None and str(prompt_hash).strip():
-        return str(prompt_hash)
 
     if conversation_id is not None and str(conversation_id).strip():
         return str(conversation_id)
@@ -871,7 +862,6 @@ def process_single_record(
     This is the unit executed in parallel by the ThreadPoolExecutor.
     """
     conversation_id = safe_json_serializable(row.get("conversation_id", None))
-    prompt_hash = safe_json_serializable(row.get("prompt_hash", None))
 
     processing_key = get_processing_key(
         parquet_name=parquet_name,
@@ -887,24 +877,6 @@ def process_single_record(
         row.get("conversation", None),
         user_message_index=user_message_index,
     )
-
-    base_result = {
-        "processing_key": processing_key,
-        "conversation_id": conversation_id,
-        "source_file": parquet_name,
-        "row_index": int(row_index) if isinstance(row_index, int) else str(row_index),
-        "source_model": source_model,
-        "turn": turn,
-        "snippet_turns": snippet_turns,
-        "user_message_index": user_message_index,
-        "classifier_model": model,
-        "user_prompt_preview": user_prompt_original[:500],
-        "prompt_hash": prompt_hash,
-        "representative_conversation_id": safe_json_serializable(row.get("representative_conversation_id", None)),
-        "representative_source_file": safe_json_serializable(row.get("representative_source_file", None)),
-        "representative_row_index": safe_json_serializable(row.get("representative_row_index", None)),
-        "duplicate_count": safe_json_serializable(row.get("duplicate_count", None)),
-    }
 
     # Step 1: code/NL separation.
     separation = separate_prompt_code_nl(
@@ -950,7 +922,6 @@ def process_single_record(
 
     return {
         "processing_key": processing_key,
-        "prompt_hash": prompt_hash,
 
         "conversation_id": conversation_id,
         "source_file": parquet_name,
