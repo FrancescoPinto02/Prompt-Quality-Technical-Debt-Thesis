@@ -24,8 +24,11 @@ TASK_LANG_PROMPT_PATH = Path("prompt/LangAndTaskClassification.txt")
 # Filtering settings
 FILTER_NON_ENGLISH = True
 FILTER_MULTITURN = True
-SINGLE_TURN_METHOD = "both"  # "turn_column", "user_message_count", or "both"
-DUPLICATE_MODE = "drop_all"       # "none", "keep_first", or "drop_all"
+SINGLE_TURN_METHOD = "both" # "turn_column", "user_message_count", or "both"
+DUPLICATE_STRATEGY = "fuzzy" # "exact" or "fuzzy"
+DUPLICATE_MODE = "keep_first"  # "none", "keep_first", or "drop_all"
+FUZZY_PREFIX_CHARS = 1000
+FUZZY_THRESHOLD = 90.0
 DROP_EMPTY_FIRST_PROMPT = True
 ROWS_PER_FILTERED_FILE = 10_000
 OVERWRITE_FILTERED = True
@@ -38,7 +41,6 @@ MAX_ROWS_PER_FILE = None
 # LLM provider settings.
 # LM Studio:
 API_BASE = "http://localhost:1234/v1"
-#MODEL = "qwen/qwen3.6-35b-a3b"
 MODEL = "qwen/qwen2.5-7b-instruct"
 API_KEY = None
 
@@ -62,10 +64,10 @@ TIMEOUT = 300
 
 # Optional LLM test limit.
 # Set to None for full filtered dataset.
-LLM_MAX_ROWS = 1
+LLM_MAX_ROWS = None
 
 # If True, skip filtering and process the existing FILTERED_OUTPUT_DIR.
-SKIP_FILTERING = False
+SKIP_FILTERING = True
 
 
 # ============================================================
@@ -100,7 +102,7 @@ def build_filter_command() -> list[str]:
     """
     command = [
         sys.executable,
-        "scripts/filter_raw_dataset.py",
+        "scripts/filter_raw_dataset1.py",
         "--input-dir",
         str(RAW_INPUT_DIR),
         "--output-dir",
@@ -109,8 +111,14 @@ def build_filter_command() -> list[str]:
         str(FILTERED_REPORT_DIR),
         "--single-turn-method",
         SINGLE_TURN_METHOD,
+        "--duplicate-strategy",
+        DUPLICATE_STRATEGY,
         "--duplicate-mode",
         DUPLICATE_MODE,
+        "--fuzzy-prefix-chars",
+        str(FUZZY_PREFIX_CHARS),
+        "--fuzzy-threshold",
+        str(FUZZY_THRESHOLD),
         "--rows-per-output-file",
         str(ROWS_PER_FILTERED_FILE),
     ]
@@ -187,7 +195,12 @@ def main() -> None:
     print(f"LLM_OUTPUT_DIR: {LLM_OUTPUT_DIR}")
     print(f"API_BASE: {API_BASE}")
     print(f"MODEL: {MODEL}")
+    print(f"DUPLICATE_STRATEGY: {DUPLICATE_STRATEGY}")
+    print(f"DUPLICATE_MODE: {DUPLICATE_MODE}")
+    print(f"FUZZY_PREFIX_CHARS: {FUZZY_PREFIX_CHARS}")
+    print(f"FUZZY_THRESHOLD: {FUZZY_THRESHOLD}")
     print(f"WORKERS: {WORKERS}")
+    print(f"LLM_MAX_ROWS: {LLM_MAX_ROWS}")
     print(f"SKIP_FILTERING: {SKIP_FILTERING}")
     print("=" * 100)
 
