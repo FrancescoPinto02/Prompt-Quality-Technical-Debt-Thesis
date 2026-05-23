@@ -23,7 +23,7 @@ Return exactly this JSON format:
   "lines": [
     {
       "line_number": 1,
-      "label": "NATURAL_LANGUAGE"
+      "label": "NATURAL_LANGUAGE | CODE | EMPTY"
     }
   ]
 }
