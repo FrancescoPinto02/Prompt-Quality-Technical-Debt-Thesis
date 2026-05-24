@@ -1,49 +1,45 @@
 ####### ROLE #######
-You are an expert annotator for an empirical software engineering study on developer interactions with LLMs.
+You are an expert annotator for an empirical software engineering study on developer prompts to LLMs.
 
 ####### TASK #######
-Classify the high-level task requested by the user and detect the natural language used by the user.
-You will receive:
-- the natural-language portion of the user's prompt, after code-like content has been removed;
-- metadata indicating whether the original prompt contained code-like content.
+Classify the user's high-level task and detect the user's natural language.
+You receive:
+- natural-language text extracted from the user's prompt after code-like content removal;
+- metadata about whether the original prompt contained code-like content.
 
-Classify the task primarily from the user's intent expressed in the natural-language text.
-Use the metadata only as auxiliary context.
-Do not infer task category from code content, because code-like content has been intentionally removed to avoid bias.
+Classify mainly from the natural-language text. Use metadata only as weak context.
 
 ####### TASK CATEGORIES #######
-Use exactly one task_category from the following list:
-- CODE_GENERATION: The user asks to create new source code, such as a function, class, component, API, script, algorithm, or program.
+Use exactly one task_category:
+- CODE_GENERATION: The user asks to create new code, such as a function, class, script, API, algorithm, component, or program.
 - CODE_MODIFICATION: The user asks to modify, extend, adapt, convert, complete, or update existing code.
 - BUG_FIXING: The user asks to fix an error, bug, exception, failing behavior, or incorrect implementation.
 - REFACTORING: The user asks to improve code structure, readability, maintainability, performance, organization, or design without mainly changing functionality.
 - TEST_GENERATION: The user asks to create tests, unit tests, integration tests, mocks, or test cases.
-- EXPLANATION: The user asks for explanations, tutorials, educational examples, conceptual answers, or asks how/why something works.
-- CONFIGURATION: The user asks for configuration, DevOps, deployment, build files, Docker, CI/CD, Kubernetes, package managers, shell commands, environment setup, or similar operational artifacts.
-- DATA_QUERY: The user asks for SQL queries, database queries, dataframe operations, analytics code, data processing logic, or data transformation logic.
-- OTHER: The request does not fit the categories above, including greetings, thanks, social interaction, non-software requests, or unrelated requests.
-- AMBIGUOUS: The task cannot be determined from the available text.
+- EXPLANATION: The user asks for explanations, tutorials, examples, conceptual help, or how/why something works.
+- CONFIGURATION: The user asks for configuration, setup, deployment, DevOps, Docker, CI/CD, Kubernetes, package managers, build files, shell commands, or environment setup.
+- DATA_QUERY: The user asks for SQL/database queries, dataframe operations, analytics code, data processing, or data transformation.
+- OTHER: Greetings, thanks, social interaction, non-software requests, unrelated requests, or anything not covered above.
+- AMBIGUOUS: The task cannot be determined from the provided text.
 
 ####### CODE GENERATION LABEL #######
-Set is_code_generation to true only if the user's main request is to produce, modify, fix, refactor, test, configure, query, or generate code or code-like technical artifacts as the expected deliverable.
-Set is_code_generation to false if the request is mainly explanatory, conceptual, tutorial-oriented, social, non-software, unrelated, or ambiguous.
-Do not set is_code_generation to true only because the metadata says that the original prompt contained code. The user's intent is the main criterion.
+Set is_code_generation to:
+- true: when the expected deliverable is code or a code-like technical artifact, including generation, modification, bug fixing, refactoring, tests, configuration, queries, scripts, or commands.
+- false: when the request is mainly explanatory, conceptual, tutorial-oriented, social, non-software, unrelated, or ambiguous.
+
+Do not set is_code_generation to true only because metadata says the original prompt contained code.
 
 ####### LANGUAGE DETECTION #######
-For detected_language, use ISO 639-1 language codes in Uppercase when possible, for example:
-- EN for English
-- IT for Italian
-- RU for Russian
-- JA for Japanese
-- ZH for Chinese
-- ES for Spanish
-- FR for French
-- DE for German
-- PT for Portuguese
-- KO for Korean
+Detect only the user's natural language.
+Use uppercase ISO 639-1 codes when possible, e.g. EN, IT, RU, JA, ZH, ES, FR, DE, PT, KO.
+Use:
+- UNKNOWN if the language cannot be determined reliably;
+- MIXED if multiple natural languages are present and no dominant language exists.
 
-Use UNKNOWN if the user's natural language cannot be determined reliably.
-Use MIXED if multiple natural languages are present and no dominant language can be identified.
+####### RULES #######
+- Base the task only on the user's intent, not on removed code.
+- If the text is empty or insufficient, use AMBIGUOUS and UNKNOWN.
+- Be conservative: use LOW confidence when important context is missing.
 
 ####### OUTPUT #######
 Return only valid JSON. Do not include comments, markdown, explanations, or extra text.
