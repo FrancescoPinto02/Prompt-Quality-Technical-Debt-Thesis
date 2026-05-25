@@ -264,6 +264,7 @@ def call_chat_completion(
     temperature: float = 0.0,
     max_tokens: int = 2048,
     timeout: int = 180,
+    enable_thinking: bool = False,
 ) -> str:
     """
     Calls an OpenAI-compatible /chat/completions endpoint.
@@ -297,6 +298,11 @@ def call_chat_completion(
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": False,
+
+        "top_k": 20,
+        "chat_template_kwargs": {
+            "enable_thinking": enable_thinking,
+        },
     }
 
     response = requests.post(
@@ -469,6 +475,7 @@ def classify_line_batch(
                 api_key=api_key,
                 max_tokens=max_tokens,
                 timeout=timeout,
+                enable_thinking=False,
             )
 
             parsed = extract_json_object(raw_response)
@@ -797,6 +804,7 @@ def classify_task_and_language(
                 api_key=api_key,
                 max_tokens=max_tokens,
                 timeout=timeout,
+                enable_thinking=True,
             )
 
             parsed = extract_json_object(raw_response)
