@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -7,21 +8,24 @@ from pathlib import Path
 # Hardcoded pipeline configuration
 # ============================================================
 
+# Scripts
+FILTER_SCRIPT_PATH = Path("scripts/filter_raw_dataset.py")
+PROCESSING_SCRIPT_PATH = Path("scripts/run_full_record_processing.py")
+
 # Input raw dataset
 RAW_INPUT_DIR = Path("data/raw")
 
 # Filtered dataset output
-FILTERED_OUTPUT_DIR = Path("data/filtered")
-FILTERED_REPORT_DIR = Path("data/filtered/reports")
+FILTERED_OUTPUT_DIR = Path("data/filtered/v1")
+FILTERED_REPORT_DIR = Path("data/filtered/v1/reports")
 
 # Final LLM processing output
-LLM_OUTPUT_DIR = Path("data/processed")
+LLM_OUTPUT_DIR = Path("data/processed/v1")
 
-# Prompt files
-CODE_NL_PROMPT_PATH = Path("prompt/CodeNLSeparation.txt")
-TASK_LANG_PROMPT_PATH = Path("prompt/LangAndTaskClassification.txt")
 
+# ============================================================
 # Filtering settings
+# ============================================================
 FILTER_NON_ENGLISH = True
 FILTER_MULTITURN = True
 SINGLE_TURN_METHOD = "both" # "turn_column", "user_message_count", or "both"
@@ -38,33 +42,34 @@ OVERWRITE_FILTERED = True
 MAX_FILES = None
 MAX_ROWS_PER_FILE = None
 
-# LLM provider settings.
-# LM Studio:
-API_BASE = "http://localhost:1234/v1"
-MODEL = "qwen/qwen2.5-7b-instruct"
-API_KEY = None
 
-# Fake LLM example:
-# API_BASE = "http://127.0.0.1:8000/v1"
-# MODEL = "fake-llm"
+# ============================================================
+# LLM provider settings
+# ============================================================
+
+# LM Studio example:
+# API_BASE = "http://localhost:1234/v1"
+# MODEL = "qwen2.5-7b-instruct"
 # API_KEY = None
 
 # OpenAI example:
-# API_BASE = "https://api.openai.com/v1"
-# MODEL = "gpt-4.1-mini"
-# API_KEY = None  # Uses OPENAI_API_KEY env var if None
+API_BASE = "https://api.openai.com/v1"
+MODEL = "gpt-5.4-nano"
+API_KEY = None  # Uses OPENAI_API_KEY env var if None
 
+
+# ============================================================
 # LLM processing settings
+# ============================================================
+
 WORKERS = 4
-LINE_BATCH_SIZE = 20
-RETRIES = 2
-MAX_TOKENS_CODE_NL = 4096
-MAX_TOKENS_TASK_LANG = 4096
-TIMEOUT = 300
 
 # Optional LLM test limit.
 # Set to None for full filtered dataset.
 LLM_MAX_ROWS = None
+
+# Stop processing if too many problematic records are produced.
+MAX_BAD_RECORDS = 5
 
 # If True, skip filtering and process the existing FILTERED_OUTPUT_DIR.
 SKIP_FILTERING = True
@@ -74,6 +79,27 @@ SKIP_FILTERING = True
 # Utility
 # ============================================================
 
+def redact_command_for_print(command: list[str]) -> str:
+    """
+    Returns a printable command with sensitive values redacted.
+    """
+    redacted = []
+    skip_next = False
+
+    for i, token in enumerate(command):
+        if skip_next:
+            skip_next = False
+            continue
+
+        if token == "--api-key" and i + 1 < len(command):
+            redacted.extend(["--api-key", "***REDACTED***"])
+            skip_next = True
+        else:
+            redacted.append(token)
+
+    return " ".join(redacted)
+
+
 def run_command(command: list[str], step_name: str) -> None:
     """
     Runs one pipeline step and stops immediately if it fails.
@@ -82,7 +108,7 @@ def run_command(command: list[str], step_name: str) -> None:
     print(f"STEP: {step_name}")
     print("=" * 100)
     print("Command:")
-    print(" ".join(command))
+    print(redact_command_for_print(command))
     print("=" * 100 + "\n")
 
     result = subprocess.run(command)
@@ -102,7 +128,7 @@ def build_filter_command() -> list[str]:
     """
     command = [
         sys.executable,
-        "scripts/filter_raw_dataset1.py",
+        str(FILTER_SCRIPT_PATH),
         "--input-dir",
         str(RAW_INPUT_DIR),
         "--output-dir",
@@ -146,11 +172,11 @@ def build_filter_command() -> list[str]:
 
 def build_llm_processing_command() -> list[str]:
     """
-    Builds the command for the record-level LLM processing script.
+    Builds the command for the simplified record-level LLM processing script.
     """
     command = [
         sys.executable,
-        "scripts/run_full_record_processing.py",
+        str(PROCESSING_SCRIPT_PATH),
         "--input-dir",
         str(FILTERED_OUTPUT_DIR),
         "--output-dir",
@@ -161,27 +187,18 @@ def build_llm_processing_command() -> list[str]:
         MODEL,
         "--workers",
         str(WORKERS),
-        "--line-batch-size",
-        str(LINE_BATCH_SIZE),
-        "--retries",
-        str(RETRIES),
-        "--max-tokens-code-nl",
-        str(MAX_TOKENS_CODE_NL),
-        "--max-tokens-task-lang",
-        str(MAX_TOKENS_TASK_LANG),
-        "--timeout",
-        str(TIMEOUT),
-        "--code-nl-prompt-path",
-        str(CODE_NL_PROMPT_PATH),
-        "--task-lang-prompt-path",
-        str(TASK_LANG_PROMPT_PATH),
     ]
 
-    if API_KEY is not None:
-        command.extend(["--api-key", API_KEY])
+    effective_api_key = API_KEY or os.getenv("OPENAI_API_KEY")
+
+    if effective_api_key:
+        command.extend(["--api-key", effective_api_key])
 
     if LLM_MAX_ROWS is not None:
         command.extend(["--max-rows", str(LLM_MAX_ROWS)])
+
+    if MAX_BAD_RECORDS is not None:
+        command.extend(["--max-bad-records", str(MAX_BAD_RECORDS)])
 
     return command
 
@@ -189,6 +206,8 @@ def build_llm_processing_command() -> list[str]:
 def main() -> None:
     print("\nPipeline configuration")
     print("=" * 100)
+    print(f"FILTER_SCRIPT_PATH: {FILTER_SCRIPT_PATH}")
+    print(f"PROCESSING_SCRIPT_PATH: {PROCESSING_SCRIPT_PATH}")
     print(f"RAW_INPUT_DIR: {RAW_INPUT_DIR}")
     print(f"FILTERED_OUTPUT_DIR: {FILTERED_OUTPUT_DIR}")
     print(f"FILTERED_REPORT_DIR: {FILTERED_REPORT_DIR}")
@@ -201,6 +220,7 @@ def main() -> None:
     print(f"FUZZY_THRESHOLD: {FUZZY_THRESHOLD}")
     print(f"WORKERS: {WORKERS}")
     print(f"LLM_MAX_ROWS: {LLM_MAX_ROWS}")
+    print(f"MAX_BAD_RECORDS: {MAX_BAD_RECORDS}")
     print(f"SKIP_FILTERING: {SKIP_FILTERING}")
     print("=" * 100)
 

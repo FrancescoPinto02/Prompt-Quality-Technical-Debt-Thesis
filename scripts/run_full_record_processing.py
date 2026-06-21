@@ -14,13 +14,24 @@ from tqdm import tqdm
 
 
 # ============================================================
+# Internal configuration
+# ============================================================
+
+CODE_NL_PROMPT_PATH = Path("prompt/gpt-5_4-nano/CodeNLSeparation.txt")
+TASK_LANG_PROMPT_PATH = Path("prompt/gpt-5_4-nano/LangAndTaskClassification.txt")
+
+LINE_BATCH_SIZE = 15
+RETRIES = 0
+REQUEST_TIMEOUT = 180
+
+
+# ============================================================
 # Constants
 # ============================================================
 
 COMPACT_TO_FULL_LINE_LABEL = {
     "N": "NATURAL_LANGUAGE",
     "C": "CODE",
-    "E": "EMPTY",
 }
 
 VALID_COMPACT_LINE_LABELS = set(COMPACT_TO_FULL_LINE_LABEL.keys())
@@ -56,12 +67,10 @@ SPECIAL_LANGUAGE_CODES = {"UNKNOWN", "MIXED"}
 # ============================================================
 
 def load_text_file(path: Path) -> str:
-    """Loads a UTF-8 prompt file."""
     return path.read_text(encoding="utf-8").strip()
 
 
 def safe_json_serializable(value: Any) -> Any:
-    """Converts pandas/numpy/pyarrow values into JSON-safe Python objects."""
     if value is None:
         return None
 
@@ -93,11 +102,6 @@ def safe_json_serializable(value: Any) -> Any:
 
 
 def extract_json_object(text: str) -> Dict[str, Any]:
-    """
-    Extracts a JSON object from an LLM response.
-
-    Handles raw JSON and JSON wrapped in markdown fences.
-    """
     cleaned = (text or "").strip()
 
     cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.IGNORECASE)
@@ -110,13 +114,22 @@ def extract_json_object(text: str) -> Dict[str, Any]:
             return obj
         raise ValueError("Parsed JSON is not an object.")
     except json.JSONDecodeError:
-        pass
+        repaired = try_repair_missing_l_closing_bracket(cleaned)
+
+        if repaired is not None:
+            try:
+                obj = json.loads(repaired)
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                pass
 
     match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
     if not match:
         raise ValueError("No JSON object found in model response.")
 
     obj = json.loads(match.group(0))
+
     if not isinstance(obj, dict):
         raise ValueError("Parsed JSON is not an object.")
 
@@ -124,14 +137,12 @@ def extract_json_object(text: str) -> Dict[str, Any]:
 
 
 def write_jsonl(path: Path, obj: Dict[str, Any]) -> None:
-    """Appends one JSON object to a JSONL file."""
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
         f.flush()
 
 
 def load_processed_keys(output_path: Path) -> Set[str]:
-    """Reads existing JSONL results and returns already processed keys."""
     processed = set()
 
     if not output_path.exists():
@@ -151,12 +162,6 @@ def load_processed_keys(output_path: Path) -> Set[str]:
 
 
 def get_processing_key(parquet_name: str, row_index: Any, row: pd.Series) -> str:
-    """
-    Stable key used for resume.
-
-    In the filtered dataset, conversation_id should be unique enough.
-    If missing, fallback to file name + row index.
-    """
     conversation_id = safe_json_serializable(row.get("conversation_id", None))
 
     if conversation_id is not None and str(conversation_id).strip():
@@ -166,7 +171,6 @@ def get_processing_key(parquet_name: str, row_index: Any, row: pd.Series) -> str
 
 
 def is_valid_language_code(value: str) -> bool:
-    """Validates UNKNOWN, MIXED, or ISO-639-1-like uppercase language codes."""
     if value in SPECIAL_LANGUAGE_CODES:
         return True
 
@@ -178,13 +182,11 @@ def is_valid_language_code(value: str) -> bool:
 # ============================================================
 
 def normalize_conversation(conversation: Any) -> List[Dict[str, Any]]:
-    """
-    Flattens CodeChat conversation objects into a list of message dictionaries.
-    """
     messages: List[Dict[str, Any]] = []
 
     def _maybe_parse_string(obj: str) -> Any:
         obj = obj.strip()
+
         if not obj:
             return None
 
@@ -199,8 +201,10 @@ def normalize_conversation(conversation: Any) -> List[Dict[str, Any]]:
 
         if isinstance(obj, str):
             parsed = _maybe_parse_string(obj)
+
             if parsed is not obj:
                 _flatten(parsed)
+
             return
 
         if isinstance(obj, dict):
@@ -210,6 +214,7 @@ def normalize_conversation(conversation: Any) -> List[Dict[str, Any]]:
 
             for value in obj.values():
                 _flatten(value)
+
             return
 
         if hasattr(obj, "tolist") and not isinstance(obj, (str, bytes)):
@@ -222,48 +227,42 @@ def normalize_conversation(conversation: Any) -> List[Dict[str, Any]]:
         if isinstance(obj, (list, tuple)):
             for item in obj:
                 _flatten(item)
+
             return
 
     _flatten(conversation)
     return messages
 
 
-def extract_user_prompt(conversation: Any, user_message_index: int = 0) -> str:
-    """Extracts the N-th user message from a conversation."""
+def extract_user_prompt(conversation: Any) -> str:
+    """
+    Extracts the first user message.
+
+    This is enough because the dataset should already be filtered to single-turn
+    conversations before this script.
+    """
     messages = normalize_conversation(conversation)
 
-    user_messages = [
-        msg for msg in messages
-        if str(msg.get("role", "")).strip().lower() == "user"
-    ]
+    for msg in messages:
+        if str(msg.get("role", "")).strip().lower() == "user":
+            content = msg.get("content", "")
+            return "" if content is None else str(content)
 
-    if not user_messages or user_message_index >= len(user_messages):
-        return ""
-
-    content = user_messages[user_message_index].get("content", "")
-    return "" if content is None else str(content)
+    return ""
 
 
 # ============================================================
 # OpenAI-compatible client
 # ============================================================
 
-def build_chat_payload(
-    model: str,
-    prompt: str,
-    max_tokens: int,
-    token_param: str,
-    temperature: Optional[float],
-) -> Dict[str, Any]:
+def build_chat_payload(model: str, prompt: str) -> Dict[str, Any]:
     """
-    Builds a conservative OpenAI-compatible chat completion payload.
+    Builds a minimal chat completion payload.
 
-    token_param:
-    - max_tokens: LM Studio and many OpenAI chat models
-    - max_completion_tokens: some newer OpenAI models
-    - none: omit token limit
+    No max_tokens / max_completion_tokens is sent, to avoid compatibility issues
+    between LM Studio and different OpenAI models.
     """
-    payload: Dict[str, Any] = {
+    return {
         "model": model,
         "messages": [
             {
@@ -274,52 +273,32 @@ def build_chat_payload(
         "stream": False,
     }
 
-    if token_param != "none":
-        payload[token_param] = max_tokens
-
-    if temperature is not None:
-        payload["temperature"] = temperature
-
-    return payload
-
 
 def call_chat_completion(
     api_base: str,
     model: str,
     prompt: str,
     api_key: Optional[str],
-    max_tokens: int,
-    timeout: int,
-    token_param: str,
-    temperature: Optional[float],
 ) -> str:
-    """
-    Calls an OpenAI-compatible /chat/completions endpoint.
-
-    Compatible with:
-    - LM Studio: api_base=http://localhost:1234/v1, api_key=None
-    - OpenAI API: api_base=https://api.openai.com/v1, api_key or OPENAI_API_KEY
-    """
     url = api_base.rstrip("/") + "/chat/completions"
 
     headers = {"Content-Type": "application/json"}
+
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
     payload = build_chat_payload(
         model=model,
         prompt=prompt,
-        max_tokens=max_tokens,
-        token_param=token_param,
-        temperature=temperature,
     )
 
     response = requests.post(
         url,
         headers=headers,
         json=payload,
-        timeout=timeout,
+        timeout=REQUEST_TIMEOUT,
     )
+
     response.raise_for_status()
 
     data = response.json()
@@ -331,6 +310,7 @@ def call_chat_completion(
     if not content.strip():
         reasoning = message.get("reasoning_content", "")
         finish_reason = choice.get("finish_reason")
+
         raise ValueError(
             "LLM returned empty content. "
             f"finish_reason={finish_reason}. "
@@ -345,30 +325,21 @@ def call_with_retries(
     model: str,
     prompt: str,
     api_key: Optional[str],
-    max_tokens: int,
-    timeout: int,
-    token_param: str,
-    temperature: Optional[float],
-    retries: int,
 ) -> str:
-    """Calls the LLM with simple retry logic."""
     last_error = None
 
-    for attempt in range(retries + 1):
+    for attempt in range(RETRIES + 1):
         try:
             return call_chat_completion(
                 api_base=api_base,
                 model=model,
                 prompt=prompt,
                 api_key=api_key,
-                max_tokens=max_tokens,
-                timeout=timeout,
-                token_param=token_param,
-                temperature=temperature,
             )
         except Exception as exc:
             last_error = exc
-            if attempt < retries:
+
+            if attempt < RETRIES:
                 time.sleep(1.0)
 
     raise RuntimeError(str(last_error))
@@ -379,28 +350,36 @@ def call_with_retries(
 # ============================================================
 
 def split_lines(text: str) -> List[str]:
-    """Splits prompt text into original lines."""
     return [] if text is None else str(text).splitlines()
 
 
-def make_line_batches(lines: List[str], batch_size: int) -> List[List[Tuple[int, str]]]:
-    """Creates compact line batches: [(line_number, line_text), ...]."""
-    numbered_lines = [(i + 1, line) for i, line in enumerate(lines)]
+def make_line_batches(lines: List[str]) -> List[List[Tuple[int, str]]]:
+    """
+    Creates compact line batches for non-empty lines only.
+
+    Empty or whitespace-only lines are classified directly in code as EMPTY.
+    """
+    numbered_non_empty_lines = [
+        (i + 1, line)
+        for i, line in enumerate(lines)
+        if line.strip()
+    ]
+
     return [
-        numbered_lines[i:i + batch_size]
-        for i in range(0, len(numbered_lines), batch_size)
+        numbered_non_empty_lines[i:i + LINE_BATCH_SIZE]
+        for i in range(0, len(numbered_non_empty_lines), LINE_BATCH_SIZE)
     ]
 
 
-def build_code_nl_prompt(prompt_template: str, line_batch: List[Tuple[int, str]]) -> str:
-    """
-    Builds compact input for the code/NL prompt.
-
-    Input format:
-        {"l":[[1,"text"],[2,"text"]]}
-    """
+def build_code_nl_prompt(
+    prompt_template: str,
+    line_batch: List[Tuple[int, str]],
+) -> str:
     payload = {
-        "l": [[line_number, text] for line_number, text in line_batch]
+        "l": [
+            [relative_line_id, text]
+            for relative_line_id, (_, text) in enumerate(line_batch, start=1)
+        ]
     }
 
     return (
@@ -411,52 +390,94 @@ def build_code_nl_prompt(prompt_template: str, line_batch: List[Tuple[int, str]]
     )
 
 
+def try_repair_missing_l_closing_bracket(text: str) -> Optional[str]:
+    """
+    Repairs a common malformed output:
+    {"l":[[1,"N"],[2,"C"]}
+    into:
+    {"l":[[1,"N"],[2,"C"]]}
+    """
+    candidate = text.strip()
+
+    if not candidate.startswith('{"l":'):
+        return None
+
+    if candidate.endswith("]}"):
+        repaired = candidate[:-1] + "]}"
+        return repaired
+
+    return None
+
+
 def validate_code_nl_output(
     obj: Dict[str, Any],
-    expected_line_numbers: Set[int],
+    line_batch: List[Tuple[int, str]],
 ) -> List[Dict[str, Any]]:
     """
-    Validates compact code/NL output.
+    Validates compact code/NL output with relative batch line ids.
 
-    Expected:
-        {"l":[[1,"N"],[2,"C"],[3,"E"]]}
+    Input to model:
+        {"l":[[1,"text"],[2,"text"]]}
+
+    Expected output:
+        {"l":[[1,"N"],[2,"C"]]}
+
+    Returned result uses original prompt line numbers internally.
     """
     if "l" not in obj:
         raise ValueError("Missing field: l")
 
     rows = obj["l"]
+
     if not isinstance(rows, list):
         raise ValueError("Field 'l' must be a list.")
+
+    if len(rows) != len(line_batch):
+        raise ValueError(
+            f"Wrong number of classifications: expected {len(line_batch)}, got {len(rows)}"
+        )
+
+    expected_relative_ids = set(range(1, len(line_batch) + 1))
+    seen_relative_ids = set()
+
+    original_line_by_relative_id = {
+        relative_id: original_line_number
+        for relative_id, (original_line_number, _) in enumerate(line_batch, start=1)
+    }
 
     results = []
 
     for item in rows:
         if not isinstance(item, list) or len(item) != 2:
-            raise ValueError("Each item in 'l' must be [line_number, label].")
+            raise ValueError("Each item in 'l' must be [line_id, label].")
 
-        line_number = int(item[0])
+        relative_id = int(item[0])
         compact_label = str(item[1]).strip().upper()
 
-        if line_number not in expected_line_numbers:
-            raise ValueError(f"Unexpected line_number: {line_number}")
+        if relative_id not in expected_relative_ids:
+            raise ValueError(f"Unexpected relative line_id: {relative_id}")
+
+        if relative_id in seen_relative_ids:
+            raise ValueError(f"Duplicate relative line_id: {relative_id}")
 
         if compact_label not in VALID_COMPACT_LINE_LABELS:
             raise ValueError(f"Invalid compact line label: {compact_label}")
 
+        seen_relative_ids.add(relative_id)
+
         results.append(
             {
-                "line_number": line_number,
+                "line_number": int(original_line_by_relative_id[relative_id]),
                 "label": COMPACT_TO_FULL_LINE_LABEL[compact_label],
             }
         )
 
-    returned = {int(item["line_number"]) for item in results}
-    missing = expected_line_numbers - returned
+    missing = expected_relative_ids - seen_relative_ids
 
     if missing:
-        raise ValueError(f"Missing classifications for lines: {sorted(missing)}")
+        raise ValueError(f"Missing relative line_id values: {sorted(missing)}")
 
-    return results
+    return sorted(results, key=lambda x: int(x["line_number"]))
 
 
 def classify_line_batch(
@@ -465,13 +486,7 @@ def classify_line_batch(
     api_base: str,
     model: str,
     api_key: Optional[str],
-    retries: int,
-    max_tokens: int,
-    timeout: int,
-    token_param: str,
-    temperature: Optional[float],
 ) -> Dict[str, Any]:
-    """Classifies one batch of lines as natural language, code, or empty."""
     expected_line_numbers = {int(line_number) for line_number, _ in line_batch}
     prompt = build_code_nl_prompt(prompt_template, line_batch)
 
@@ -483,15 +498,14 @@ def classify_line_batch(
             model=model,
             prompt=prompt,
             api_key=api_key,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            token_param=token_param,
-            temperature=temperature,
-            retries=retries,
         )
 
         parsed = extract_json_object(raw_response)
-        classifications = validate_code_nl_output(parsed, expected_line_numbers)
+
+        classifications = validate_code_nl_output(
+            parsed,
+            line_batch=line_batch,
+        )
 
         return {
             "status": "ok",
@@ -500,6 +514,15 @@ def classify_line_batch(
         }
 
     except Exception as exc:
+        print("\n[CODE_NL ERROR]")
+        print(f"Error: {exc}")
+        print("Input batch:")
+        for line_number, text in line_batch:
+            print(f"{line_number}: {text}")
+        print("Raw response:")
+        print(raw_response if "raw_response" in locals() else None)
+        print()
+
         return {
             "status": "error",
             "classifications": [],
@@ -511,7 +534,6 @@ def reconstruct_code_and_nl(
     original_lines: List[str],
     classifications: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Reconstructs natural-language and code strings from line labels."""
     label_by_line = {
         int(item["line_number"]): item["label"]
         for item in classifications
@@ -551,20 +573,7 @@ def separate_prompt_code_nl(
     api_base: str,
     model: str,
     api_key: Optional[str],
-    line_batch_size: int,
-    retries: int,
-    max_tokens: int,
-    timeout: int,
-    token_param: str,
-    temperature: Optional[float],
 ) -> Dict[str, Any]:
-    """
-    Separates a user prompt into natural-language and code-like content.
-
-    If one or more line batches fail, missing non-empty lines are conservatively
-    treated as NATURAL_LANGUAGE so that the downstream task classifier can still
-    see the user's intent.
-    """
     original_lines = split_lines(user_prompt_original)
 
     if not user_prompt_original.strip():
@@ -583,18 +592,22 @@ def separate_prompt_code_nl(
     all_classifications = []
     errors = []
 
-    for batch in make_line_batches(original_lines, batch_size=line_batch_size):
+    for line_number, line_text in enumerate(original_lines, start=1):
+        if not line_text.strip():
+            all_classifications.append(
+                {
+                    "line_number": line_number,
+                    "label": "EMPTY",
+                }
+            )
+
+    for batch in make_line_batches(original_lines):
         result = classify_line_batch(
             line_batch=batch,
             prompt_template=prompt_template,
             api_base=api_base,
             model=model,
             api_key=api_key,
-            retries=retries,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            token_param=token_param,
-            temperature=temperature,
         )
 
         if result["status"] == "ok":
@@ -643,11 +656,6 @@ def build_task_lang_prompt(
     contains_code: bool,
     code_line_count: int,
 ) -> str:
-    """
-    Builds task/language input.
-
-    The text is the natural-language portion obtained after code removal.
-    """
     payload = {
         "natural_language_text": natural_language_text,
         "metadata": {
@@ -665,14 +673,9 @@ def build_task_lang_prompt(
 
 
 def validate_task_lang_output(obj: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Validates compact task/language output.
-
-    Expected:
-        {"t":"CODE_GENERATION","l":"EN"}
-    """
     if "t" not in obj:
         raise ValueError("Missing field: t")
+
     if "l" not in obj:
         raise ValueError("Missing field: l")
 
@@ -700,13 +703,7 @@ def classify_task_and_language(
     api_base: str,
     model: str,
     api_key: Optional[str],
-    retries: int,
-    max_tokens: int,
-    timeout: int,
-    token_param: str,
-    temperature: Optional[float],
 ) -> Dict[str, Any]:
-    """Classifies task category and natural language."""
     prompt = build_task_lang_prompt(
         prompt_template=prompt_template,
         natural_language_text=natural_language_text,
@@ -714,19 +711,12 @@ def classify_task_and_language(
         code_line_count=code_line_count,
     )
 
-    raw_response = None
-
     try:
         raw_response = call_with_retries(
             api_base=api_base,
             model=model,
             prompt=prompt,
             api_key=api_key,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            token_param=token_param,
-            temperature=temperature,
-            retries=retries,
         )
 
         parsed = extract_json_object(raw_response)
@@ -761,16 +751,7 @@ def process_single_record(
     api_base: str,
     model: str,
     api_key: Optional[str],
-    user_message_index: int,
-    line_batch_size: int,
-    retries: int,
-    max_tokens_code_nl: int,
-    max_tokens_task_lang: int,
-    timeout: int,
-    token_param: str,
-    temperature: Optional[float],
 ) -> Dict[str, Any]:
-    """Processes one record end-to-end."""
     conversation_id = safe_json_serializable(row.get("conversation_id", None))
 
     processing_key = get_processing_key(
@@ -781,7 +762,6 @@ def process_single_record(
 
     user_prompt_original = extract_user_prompt(
         row.get("conversation", None),
-        user_message_index=user_message_index,
     )
 
     separation = separate_prompt_code_nl(
@@ -790,12 +770,6 @@ def process_single_record(
         api_base=api_base,
         model=model,
         api_key=api_key,
-        line_batch_size=line_batch_size,
-        retries=retries,
-        max_tokens=max_tokens_code_nl,
-        timeout=timeout,
-        token_param=token_param,
-        temperature=temperature,
     )
 
     task_lang = classify_task_and_language(
@@ -806,11 +780,6 @@ def process_single_record(
         api_base=api_base,
         model=model,
         api_key=api_key,
-        retries=retries,
-        max_tokens=max_tokens_task_lang,
-        timeout=timeout,
-        token_param=token_param,
-        temperature=temperature,
     )
 
     errors = []
@@ -863,26 +832,19 @@ def process_parquet_file(
     model: str,
     api_key: Optional[str],
     max_rows: Optional[int],
-    user_message_index: int,
-    line_batch_size: int,
-    retries: int,
-    max_tokens_code_nl: int,
-    max_tokens_task_lang: int,
-    timeout: int,
-    token_param: str,
-    temperature: Optional[float],
     workers: int,
-) -> None:
-    """Processes one parquet file and writes one JSONL output file."""
+    max_bad_records: Optional[int],
+) -> int:
     print(f"\nReading: {parquet_path}")
+
     df = pd.read_parquet(parquet_path)
 
     if max_rows is not None:
         df = df.head(max_rows)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    processed_keys = load_processed_keys(output_path)
 
+    processed_keys = load_processed_keys(output_path)
     rows_to_process = []
 
     for row_index, row in df.iterrows():
@@ -901,6 +863,29 @@ def process_parquet_file(
     print(f"Workers: {workers}")
     print(f"Output: {output_path}")
 
+    bad_records = 0
+
+    def update_bad_record_counter(result: Dict[str, Any]) -> None:
+        nonlocal bad_records
+
+        if result.get("overall_status") in {"partial_error", "error"}:
+            bad_records += 1
+
+            print(
+                f"[WARNING] Bad record #{bad_records}: "
+                f"conversation_id={result.get('conversation_id')} "
+                f"status={result.get('overall_status')} "
+                f"error={result.get('overall_error')}",
+                flush=True,
+            )
+
+            if max_bad_records is not None and bad_records > max_bad_records:
+                raise RuntimeError(
+                    f"Stopping because bad records exceeded limit: "
+                    f"{bad_records} > {max_bad_records}"
+                )
+
+
     write_lock = Lock()
 
     if workers <= 1:
@@ -914,17 +899,12 @@ def process_parquet_file(
                 api_base=api_base,
                 model=model,
                 api_key=api_key,
-                user_message_index=user_message_index,
-                line_batch_size=line_batch_size,
-                retries=retries,
-                max_tokens_code_nl=max_tokens_code_nl,
-                max_tokens_task_lang=max_tokens_task_lang,
-                timeout=timeout,
-                token_param=token_param,
-                temperature=temperature,
             )
+
             write_jsonl(output_path, result)
-        return
+            update_bad_record_counter(result)
+
+        return bad_records
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
@@ -938,14 +918,6 @@ def process_parquet_file(
                 api_base,
                 model,
                 api_key,
-                user_message_index,
-                line_batch_size,
-                retries,
-                max_tokens_code_nl,
-                max_tokens_task_lang,
-                timeout,
-                token_param,
-                temperature,
             ): row_index
             for row_index, row in rows_to_process
         }
@@ -959,6 +931,9 @@ def process_parquet_file(
 
             with write_lock:
                 write_jsonl(output_path, result)
+                update_bad_record_counter(result)
+
+    return bad_records
 
 
 # ============================================================
@@ -973,18 +948,18 @@ def main() -> None:
         )
     )
 
-    parser.add_argument("--input-dir", type=Path, default=Path("data/filtered"))
-    parser.add_argument("--output-dir", type=Path, default=Path("data/processed"))
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=Path("data/filtered"),
+        help="Directory containing filtered parquet files.",
+    )
 
     parser.add_argument(
-        "--code-nl-prompt-path",
+        "--output-dir",
         type=Path,
-        default=Path("prompt/CodeNLSeparation.txt"),
-    )
-    parser.add_argument(
-        "--task-lang-prompt-path",
-        type=Path,
-        default=Path("prompt/LangAndTaskClassification.txt"),
+        default=Path("data/processed"),
+        help="Directory where JSONL outputs will be written.",
     )
 
     parser.add_argument(
@@ -993,67 +968,70 @@ def main() -> None:
         default="http://localhost:1234/v1",
         help="LM Studio: http://localhost:1234/v1 | OpenAI: https://api.openai.com/v1",
     )
+
     parser.add_argument(
         "--api-key",
         type=str,
         default=None,
         help="Optional. If omitted, OPENAI_API_KEY is used when available.",
     )
-    parser.add_argument("--model", type=str, required=True)
 
     parser.add_argument(
-        "--token-param",
-        choices=["max_tokens", "max_completion_tokens", "none"],
-        default="max_tokens",
+        "--model",
+        type=str,
+        required=True,
+        help="Model name exposed by LM Studio or OpenAI.",
+    )
+
+    parser.add_argument(
+        "--file",
+        type=str,
+        default=None,
+        help="Optional single parquet filename to process.",
+    )
+
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="Optional maximum rows per parquet file. Useful for testing.",
+    )
+
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of records to process in parallel.",
+    )
+
+    parser.add_argument(
+        "--max-bad-records",
+        type=int,
+        default=None,
         help=(
-            "Token-limit parameter to send in chat/completions. "
-            "Use max_tokens for LM Studio and most models; "
-            "max_completion_tokens for some newer OpenAI models; "
-            "none to omit it."
+            "Stop processing when the number of records with overall_status "
+            "partial_error or error exceeds this value. "
+            "Default: disabled."
         ),
     )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=None,
-        help="Optional. Omitted by default for broader model compatibility.",
-    )
-
-    parser.add_argument("--file", type=str, default=None)
-    parser.add_argument("--start-file", type=str, default=None)
-    parser.add_argument("--end-file", type=str, default=None)
-    parser.add_argument("--max-rows", type=int, default=None)
-
-    parser.add_argument("--user-message-index", type=int, default=0)
-    parser.add_argument("--line-batch-size", type=int, default=20)
-    parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--retries", type=int, default=2)
-    parser.add_argument("--max-tokens-code-nl", type=int, default=512)
-    parser.add_argument("--max-tokens-task-lang", type=int, default=128)
-    parser.add_argument("--timeout", type=int, default=180)
 
     args = parser.parse_args()
 
     api_key = args.api_key or os.getenv("OPENAI_API_KEY")
 
-    code_nl_prompt_template = load_text_file(args.code_nl_prompt_path)
-    task_lang_prompt_template = load_text_file(args.task_lang_prompt_path)
+    code_nl_prompt_template = load_text_file(CODE_NL_PROMPT_PATH)
+    task_lang_prompt_template = load_text_file(TASK_LANG_PROMPT_PATH)
 
     if args.file:
         parquet_files = [args.input_dir / args.file]
     else:
         parquet_files = sorted(args.input_dir.glob("*.parquet"))
 
-        if args.start_file:
-            parquet_files = [p for p in parquet_files if p.name >= args.start_file]
-
-        if args.end_file:
-            parquet_files = [p for p in parquet_files if p.name <= args.end_file]
-
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files found in {args.input_dir}")
 
     print(f"Files to process: {len(parquet_files)}")
+
     for parquet_file in parquet_files:
         print(f" - {parquet_file.name}")
 
@@ -1072,15 +1050,8 @@ def main() -> None:
             model=args.model,
             api_key=api_key,
             max_rows=args.max_rows,
-            user_message_index=args.user_message_index,
-            line_batch_size=args.line_batch_size,
-            retries=args.retries,
-            max_tokens_code_nl=args.max_tokens_code_nl,
-            max_tokens_task_lang=args.max_tokens_task_lang,
-            timeout=args.timeout,
-            token_param=args.token_param,
-            temperature=args.temperature,
             workers=args.workers,
+            max_bad_records=args.max_bad_records,
         )
 
     print("\nProcessing completed.")
