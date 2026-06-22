@@ -9,7 +9,7 @@ Your task is to:
 CODE_GENERATION = user asks to create new code such as program, script, class, function or API.
 CODE_MODIFICATION = user asks to modify, extend, adapt, convert, complete, or update existing code.
 BUG_FIXING = user asks to fix an error or a bug in the code.
-REFACTORING = user asks to improve existing code without changing its functionality.
+REFACTORING = user asks to improve structure, readability, maintainability, performance or organization of existing code without changing its functionality.
 EXPLANATION = user asks for explanations, tutorials, examples, conceptual help, or how/why something works.
 DATA_QUERY = user asks for SQL/database queries, dataframe operations, analytics code, data processing, or data transformation.
 OTHER = anything not covered above.

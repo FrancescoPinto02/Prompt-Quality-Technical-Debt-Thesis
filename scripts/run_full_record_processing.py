@@ -22,7 +22,8 @@ TASK_LANG_PROMPT_PATH = Path("prompt/gpt-5_4-nano/LangAndTaskClassification.txt"
 
 LINE_BATCH_SIZE = 15
 RETRIES = 0
-REQUEST_TIMEOUT = 180
+REQUEST_TIMEOUT = 300
+MAX_EXTRA_CLASSIFICATIONS_TO_REPAIR = 3
 
 
 # ============================================================
@@ -376,10 +377,11 @@ def build_code_nl_prompt(
     line_batch: List[Tuple[int, str]],
 ) -> str:
     payload = {
+        "n": len(line_batch),
         "l": [
             [relative_line_id, text]
             for relative_line_id, (_, text) in enumerate(line_batch, start=1)
-        ]
+        ],
     }
 
     return (
@@ -409,6 +411,97 @@ def try_repair_missing_l_closing_bracket(text: str) -> Optional[str]:
     return None
 
 
+def normalize_compact_label(label: Any) -> str:
+    compact_label = str(label).strip().upper()
+
+    if compact_label not in VALID_COMPACT_LINE_LABELS:
+        raise ValueError(f"Invalid compact line label: {compact_label}")
+
+    return compact_label
+
+
+def try_repair_extra_code_nl_rows(
+    rows: List[Any],
+    expected_count: int,
+) -> List[Any]:
+    """
+    Repairs common LLM mistake:
+    expected 15 rows, got 16 rows.
+
+    Safe repairs:
+    - discard trailing/out-of-range rows, e.g. line_id 16 when expected 1..15;
+    - discard duplicated rows only if the duplicate has the same label.
+
+    It does NOT repair missing expected ids or conflicting duplicate labels.
+    """
+    if len(rows) <= expected_count:
+        return rows
+
+    extra_count = len(rows) - expected_count
+
+    if extra_count > MAX_EXTRA_CLASSIFICATIONS_TO_REPAIR:
+        raise ValueError(
+            f"Too many extra classifications: expected {expected_count}, got {len(rows)}"
+        )
+
+    expected_ids = list(range(1, expected_count + 1))
+    expected_id_set = set(expected_ids)
+
+    # Very common case:
+    # [[1,"N"], ... [15,"C"], [16,"C"]]
+    # If the first N rows are exactly 1...N, keep them and discard the rest.
+    try:
+        first_ids = [int(item[0]) for item in rows[:expected_count]]
+        if first_ids == expected_ids:
+            return rows[:expected_count]
+    except Exception:
+        pass
+
+    kept_by_id: Dict[int, List[Any]] = {}
+    kept_labels_by_id: Dict[int, str] = {}
+
+    for item in rows:
+        if not isinstance(item, list) or len(item) != 2:
+            raise ValueError("Each item in 'l' must be [line_id, label].")
+
+        try:
+            relative_id = int(item[0])
+        except Exception:
+            raise ValueError(f"Invalid relative line_id: {item[0]}")
+
+        # Extra out-of-range row, e.g. 16 when expected 1..15.
+        # Safe to ignore.
+        if relative_id not in expected_id_set:
+            continue
+
+        compact_label = normalize_compact_label(item[1])
+
+        if relative_id not in kept_by_id:
+            kept_by_id[relative_id] = item
+            kept_labels_by_id[relative_id] = compact_label
+            continue
+
+        # Duplicate same id with same label: safe to ignore.
+        if kept_labels_by_id[relative_id] == compact_label:
+            continue
+
+        # Duplicate same id with conflicting label: unsafe.
+        raise ValueError(
+            f"Conflicting duplicate classification for relative line_id {relative_id}: "
+            f"{kept_labels_by_id[relative_id]} vs {compact_label}"
+        )
+
+    missing = expected_id_set - set(kept_by_id.keys())
+
+    if missing:
+        raise ValueError(
+            f"Cannot repair extra classifications because expected ids are missing: "
+            f"{sorted(missing)}"
+        )
+
+    return [kept_by_id[relative_id] for relative_id in expected_ids]
+
+
 def validate_code_nl_output(
     obj: Dict[str, Any],
     line_batch: List[Tuple[int, str]],
@@ -417,10 +510,10 @@ def validate_code_nl_output(
     Validates compact code/NL output with relative batch line ids.
 
     Input to model:
-        {"l":[[1,"text"],[2,"text"]]}
+        {"n":3,"l":[[1,"text"],[2,"text"],[3,"text"]]}
 
     Expected output:
-        {"l":[[1,"N"],[2,"C"]]}
+        {"l":[[1,"N"],[2,"C"],[3,"N"]]}
 
     Returned result uses original prompt line numbers internally.
     """
@@ -432,52 +525,71 @@ def validate_code_nl_output(
     if not isinstance(rows, list):
         raise ValueError("Field 'l' must be a list.")
 
-    if len(rows) != len(line_batch):
+    expected_count = len(line_batch)
+
+    if len(rows) < expected_count:
         raise ValueError(
-            f"Wrong number of classifications: expected {len(line_batch)}, got {len(rows)}"
+            f"Wrong number of classifications: expected {expected_count}, got {len(rows)}"
         )
 
-    expected_relative_ids = set(range(1, len(line_batch) + 1))
-    seen_relative_ids = set()
+    if len(rows) > expected_count:
+        rows = try_repair_extra_code_nl_rows(
+            rows=rows,
+            expected_count=expected_count,
+        )
+
+    if len(rows) != expected_count:
+        raise ValueError(
+            f"Wrong number of classifications after repair: "
+            f"expected {expected_count}, got {len(rows)}"
+        )
+
+    expected_relative_ids = set(range(1, expected_count + 1))
 
     original_line_by_relative_id = {
         relative_id: original_line_number
         for relative_id, (original_line_number, _) in enumerate(line_batch, start=1)
     }
 
-    results = []
+    results_by_relative_id: Dict[int, Dict[str, Any]] = {}
 
     for item in rows:
         if not isinstance(item, list) or len(item) != 2:
             raise ValueError("Each item in 'l' must be [line_id, label].")
 
-        relative_id = int(item[0])
-        compact_label = str(item[1]).strip().upper()
+        try:
+            relative_id = int(item[0])
+        except Exception:
+            raise ValueError(f"Invalid relative line_id: {item[0]}")
+
+        compact_label = normalize_compact_label(item[1])
 
         if relative_id not in expected_relative_ids:
             raise ValueError(f"Unexpected relative line_id: {relative_id}")
 
-        if relative_id in seen_relative_ids:
-            raise ValueError(f"Duplicate relative line_id: {relative_id}")
+        if relative_id in results_by_relative_id:
+            previous_label = results_by_relative_id[relative_id]["label"]
+            new_label = COMPACT_TO_FULL_LINE_LABEL[compact_label]
 
-        if compact_label not in VALID_COMPACT_LINE_LABELS:
-            raise ValueError(f"Invalid compact line label: {compact_label}")
+            if previous_label == new_label:
+                continue
 
-        seen_relative_ids.add(relative_id)
+            raise ValueError(f"Duplicate relative line_id with conflicting label: {relative_id}")
 
-        results.append(
-            {
-                "line_number": int(original_line_by_relative_id[relative_id]),
-                "label": COMPACT_TO_FULL_LINE_LABEL[compact_label],
-            }
-        )
+        results_by_relative_id[relative_id] = {
+            "line_number": int(original_line_by_relative_id[relative_id]),
+            "label": COMPACT_TO_FULL_LINE_LABEL[compact_label],
+        }
 
-    missing = expected_relative_ids - seen_relative_ids
+    missing = expected_relative_ids - set(results_by_relative_id.keys())
 
     if missing:
         raise ValueError(f"Missing relative line_id values: {sorted(missing)}")
 
-    return sorted(results, key=lambda x: int(x["line_number"]))
+    return [
+        results_by_relative_id[relative_id]
+        for relative_id in sorted(results_by_relative_id)
+    ]
 
 
 def classify_line_batch(
