@@ -21,10 +21,11 @@ CODE_NL_PROMPT_PATH = Path("prompt/gpt-5_4-nano/CodeNLSeparation.txt")
 TASK_LANG_PROMPT_PATH = Path("prompt/gpt-5_4-nano/LangAndTaskClassification.txt")
 
 LINE_BATCH_SIZE = 15
-RETRIES = 0
+RETRIES = 2
 REQUEST_TIMEOUT = 300
 MAX_EXTRA_CLASSIFICATIONS_TO_REPAIR = 3
 
+SAFE_REPAIRED_STATUS = "ok_repaired"
 
 # ============================================================
 # Constants
@@ -679,6 +680,67 @@ def reconstruct_code_and_nl(
     }
 
 
+def infer_missing_line_label_from_neighbors(
+    line_number: int,
+    original_lines: List[str],
+    classifications: List[Dict[str, Any]],
+) -> str:
+    """
+    Infers the label for a missing line using its nearest classified neighbors.
+
+    If the closest previous classified non-empty line and the closest next
+    classified non-empty line have the same label, return that label.
+
+    Otherwise:
+    - empty / whitespace-only line -> EMPTY
+    - non-empty line -> NATURAL_LANGUAGE
+    """
+    line_text = original_lines[line_number - 1]
+
+    if not line_text.strip():
+        return "EMPTY"
+
+    label_by_line = {
+        int(item["line_number"]): item["label"]
+        for item in classifications
+    }
+
+    previous_label = None
+    next_label = None
+
+    # Look backward for the nearest classified non-empty line.
+    for previous_line_number in range(line_number - 1, 0, -1):
+        previous_line_text = original_lines[previous_line_number - 1]
+
+        if not previous_line_text.strip():
+            continue
+
+        if previous_line_number in label_by_line:
+            previous_label = label_by_line[previous_line_number]
+            break
+
+    # Look forward for the nearest classified non-empty line.
+    for next_line_number in range(line_number + 1, len(original_lines) + 1):
+        next_line_text = original_lines[next_line_number - 1]
+
+        if not next_line_text.strip():
+            continue
+
+        if next_line_number in label_by_line:
+            next_label = label_by_line[next_line_number]
+            break
+
+    if (
+        previous_label is not None
+        and next_label is not None
+        and previous_label == next_label
+        and previous_label in {"NATURAL_LANGUAGE", "CODE"}
+    ):
+        return previous_label
+
+    return "NATURAL_LANGUAGE"
+
+
 def separate_prompt_code_nl(
     user_prompt_original: str,
     prompt_template: str,
@@ -703,6 +765,7 @@ def separate_prompt_code_nl(
 
     all_classifications = []
     errors = []
+    repairs = []
 
     for line_number, line_text in enumerate(original_lines, start=1):
         if not line_text.strip():
@@ -724,6 +787,11 @@ def separate_prompt_code_nl(
 
         if result["status"] == "ok":
             all_classifications.extend(result["classifications"])
+
+        elif result["status"] == "ok_repaired":
+            all_classifications.extend(result["classifications"])
+            repairs.append(result.get("repair_note", "batch repaired"))
+
         else:
             errors.append(result["error"])
 
@@ -731,9 +799,18 @@ def separate_prompt_code_nl(
     expected = set(range(1, len(original_lines) + 1))
     missing = sorted(expected - classified)
 
+    if missing:
+        repairs.append(
+            f"missing lines inferred by fallback: {missing}"
+        )
+
     for line_number in missing:
-        line_text = original_lines[line_number - 1]
-        fallback_label = "EMPTY" if not line_text.strip() else "NATURAL_LANGUAGE"
+        fallback_label = infer_missing_line_label_from_neighbors(
+            line_number=line_number,
+            original_lines=original_lines,
+            classifications=all_classifications,
+        )
+
         all_classifications.append(
             {
                 "line_number": line_number,
@@ -751,10 +828,20 @@ def separate_prompt_code_nl(
         classifications=all_classifications,
     )
 
+    if errors:
+        code_nl_status = "partial_error"
+        code_nl_error = " | ".join(errors)
+    elif repairs:
+        code_nl_status = "ok_repaired"
+        code_nl_error = None
+    else:
+        code_nl_status = "ok"
+        code_nl_error = None
+
     return {
         **reconstructed,
-        "code_nl_status": "ok" if not errors else "partial_error",
-        "code_nl_error": " | ".join(errors) if errors else None,
+        "code_nl_status": code_nl_status,
+        "code_nl_error": code_nl_error,
     }
 
 
@@ -896,7 +983,7 @@ def process_single_record(
 
     errors = []
 
-    if separation["code_nl_status"] not in {"ok", "empty_prompt"}:
+    if separation["code_nl_status"] not in {"ok", "ok_repaired", "empty_prompt"}:
         errors.append(f"code_nl: {separation['code_nl_error']}")
 
     if task_lang["task_lang_status"] != "ok":
