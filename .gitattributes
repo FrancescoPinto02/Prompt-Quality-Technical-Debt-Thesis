@@ -1,0 +1,11 @@
+*.parquet filter=lfs diff=lfs merge=lfs -text
+data/final/v1/part_000.parquet filter=lfs diff=lfs merge=lfs -text
+data/final/v1/part_001.parquet filter=lfs diff=lfs merge=lfs -text
+data/final/v1/part_002.parquet filter=lfs diff=lfs merge=lfs -text
+data/final/v1/part_003.parquet filter=lfs diff=lfs merge=lfs -text
+data/final/v1/part_004.parquet filter=lfs diff=lfs merge=lfs -text
+data/final/v1/part_005.parquet filter=lfs diff=lfs merge=lfs -text
+data/final/v1/part_006.parquet filter=lfs diff=lfs merge=lfs -text
+*.json filter=lfs diff=lfs merge=lfs -text
+*.jsonl filter=lfs diff=lfs merge=lfs -text
+*.csv filter=lfs diff=lfs merge=lfs -text
