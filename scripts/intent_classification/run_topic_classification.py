@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
 from tqdm import tqdm
@@ -23,12 +24,11 @@ from llm_classification_utils import (
 # ============================================================
 
 INPUT_DIR = PROJECT_ROOT / "data/final/v1"
-OUTPUT_JSONL = PROJECT_ROOT / "data/intent_classification/task_classification.jsonl"
+OUTPUT_JSONL = PROJECT_ROOT / "data/intent_classification/topic_classification.jsonl"
 
 DEBUG_CONTEXT_ONLY = False
-DEBUG_CONTEXT_OUTPUT_DIR = PROJECT_ROOT / "data/intent_classification/debug_task"
+DEBUG_CONTEXT_OUTPUT_DIR = PROJECT_ROOT / "data/intent_classification/debug_topic"
 
-# Use the LLM-based language classification already present in the dataset.
 ALLOWED_DETECTED_LANGUAGES = {"EN"}
 
 TARGET_CONVERSATION_ID: Optional[str] = None
@@ -39,10 +39,8 @@ MAX_CONVERSATIONS: Optional[int] = 25
 OVERWRITE_OUTPUT = False
 RESUME = True
 
-# Number of parallel requests sent to LM Studio.
 WORKERS = 1
 
-# LM Studio OpenAI-compatible API.
 API_BASE = "http://localhost:1234/v1"
 API_KEY = "lm-studio"
 MODEL = "google/gemma-4-12b-qat"
@@ -52,23 +50,22 @@ RETRIES = 1
 RETRY_SLEEP_SECONDS = 2
 TEMPERATURE = 0.0
 
-# Context construction.
 MAX_CODE_LINES_PER_BLOCK = 10
-
-# Try to force JSON output if the selected LM Studio model supports it.
 USE_RESPONSE_FORMAT = True
 
-LABEL_FIELD = "task"
-SCHEMA_NAME = "task_classification"
+LABEL_FIELD = "topic"
+SCHEMA_NAME = "topic_classification"
 
-VALID_TASKS: Set[str] = {
-    "CODE_GENERATION",
-    "CODE_MODIFICATION",
-    "EXPLANATION",
-    "ISSUE_RESOLVING",
-    "CODE_REVIEW",
-    "DATA_PROCESSING",
-    "DOCUMENTATION",
+VALID_TOPICS: Set[str] = {
+    "WEB_UI_DEVELOPMENT",
+    "DATA_ANALYTICS",
+    "SYSTEMS_NETWORKING",
+    "BACKEND_DEVELOPMENT",
+    "MACHINE_LEARNING_AI",
+    "ALGORITHMS_COMPUTATIONAL_PROBLEMS",
+    "MEDIA_SIGNAL_PROCESSING",
+    "GAME_DEVELOPMENT",
+    "DEVOPS",
     "OTHER",
 }
 
@@ -80,30 +77,32 @@ VALID_TASKS: Set[str] = {
 SYSTEM_PROMPT = """
 ##### SYSTEM #####
 You are an expert annotator for an empirical software engineering study.
-Your task is to classify developer prompts sent to LLMs based on the requested task.
-You must assign exactly one task category based on the user's primary intent.
+Your task is to classify developer prompts sent to LLMs based on the main technical topic or domain discussed in the conversation.
+You must assign exactly one topic category based on the user's primary domain of concern.
 Return only valid JSON. Do not include explanations, markdown, comments, or extra text.
 
 ##### TASK #####
-Classify the given user prompt into exactly one of the following categories:
-1-CODE_GENERATION: The user asks the LLM to create new code from a description, requirement, or context.
-2-CODE_MODIFICATION: The user asks the LLM to modify, refactor, optimize or migrate existing code.
-3-EXPLANATION: The user asks for knowledge, clarification, conceptual explanation, step-by-step guidance, tool/framework explanation, explanation about code behavior or conceptual explanation about errors.
-4-ISSUE_RESOLVING: The user asks a concrete fix of an error, bug, exception, warning or unexpected behavior inside the code.
-5-CODE_REVIEW: The user asks the LLM to evaluate or suggest conceptual improvements for code, or to compare different implementation or design choices.
-6-DATA_PROCESSING: The user asks to analyze data, generate data or transform given data in a different format.
-7-DOCUMENTATION: The user asks to create, improve, review, translate, or refine technical documentation like comments, README files or docstrings.
-8-OTHER: The prompt is ambiguous, non-software-related, or does not fit any category above.
+Classify the given user prompt into exactly one of the following topic categories:
+1-WEB_UI_DEVELOPMENT: Frontend development, UI components, layout, visual interactions, user interfaces, browser behavior and graphical interaction.
+2-DATA_ANALYTICS: Data management, data transformation, data analysis, data visualization, DataFrames, Excel/VBA, analytics workflows, trading workflows, and data-oriented automation.
+3-SYSTEMS_NETWORKING: Low-level programming, memory management, assembly, binary patching, networking, cryptography, protocols, sockets, and systems-level concerns.
+4-BACKEND_DEVELOPMENT: Server-side development, SQL schemas, ORM, APIs, microservices, caching, backend frameworks, databases, services, and distributed applications.
+5-MACHINE_LEARNING_AI: Training, deployment, integration, or use of ML/AI models, bots, inference pipelines, AI automation, NLP, computer vision models, and model-serving workflows.
+6-ALGORITHMS_COMPUTATIONAL_PROBLEMS: Algorithms, data structures, regex/text processing, optimization problems, computational tasks, functional programming, and general programming puzzles.
+7-MEDIA_SIGNAL_PROCESSING: Image, audio, video, streaming, signal processing, multimedia processing, and computational analysis of multimedia data.
+8-GAME_DEVELOPMENT: Game development, gameplay logic, controls, inventory, player-object interactions, game mechanics, engines, levels, and game UI logic.
+9-DEVOPS: Development environment, package management, version control, automation, containerization, CI/CD, deployment, application security, build tools, and system administration.
+10-OTHER: technical topic is unclear or does not fit any category above.
 
 ##### OUTPUT FORMAT #####
 Return only this JSON object:
-{"task":"CATEGORY"}
+{"topic":"CATEGORY"}
 
 ##### EXAMPLE #####
 Input:
-Write a Python function that checks whether a string is a palindrome.
+Create a React component with a responsive sidebar and a dropdown menu.
 Output:
-{"task":"CODE_GENERATION"}
+{"topic":"WEB_UI_DEVELOPMENT"}
 """.strip()
 
 
@@ -113,7 +112,7 @@ Output:
 
 def process_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Reconstructs the prompt context and classifies the requested task.
+    Reconstructs the prompt context and classifies the main technical topic.
     """
     conversation_id = safe_text(row["conversation_id"])
 
@@ -146,11 +145,11 @@ def process_row(row: Dict[str, Any]) -> Dict[str, Any]:
             "status": "ok",
         }
 
-    task = classify_with_lm_studio(
+    topic = classify_with_lm_studio(
         context=context,
         system_prompt=SYSTEM_PROMPT,
         label_field=LABEL_FIELD,
-        valid_labels=VALID_TASKS,
+        valid_labels=VALID_TOPICS,
         schema_name=SCHEMA_NAME,
         api_base=API_BASE,
         api_key=API_KEY,
@@ -164,14 +163,13 @@ def process_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "conversation_id": conversation_id,
-        LABEL_FIELD: task,
+        LABEL_FIELD: topic,
         "status": "ok",
     }
 
 
 def main() -> None:
     OUTPUT_JSONL.parent.mkdir(parents=True, exist_ok=True)
-
     clean_output(
         output_jsonl=OUTPUT_JSONL,
         overwrite_output=OVERWRITE_OUTPUT,
@@ -180,7 +178,7 @@ def main() -> None:
     completed_ids = load_completed_conversation_ids(
         output_jsonl=OUTPUT_JSONL,
         label_field=LABEL_FIELD,
-        valid_labels=VALID_TASKS,
+        valid_labels=VALID_TOPICS,
         resume=RESUME,
     )
 
@@ -215,7 +213,7 @@ def main() -> None:
         for future in tqdm(
             as_completed(future_to_conversation_id),
             total=len(future_to_conversation_id),
-            desc="Classifying tasks",
+            desc="Classifying topics",
         ):
             conversation_id = future_to_conversation_id[future]
 
