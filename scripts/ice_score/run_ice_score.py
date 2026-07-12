@@ -39,8 +39,9 @@ MAX_CONVERSATIONS: Optional[int] = None
 OVERWRITE_OUTPUT = False
 RESUME = True
 
-# Number of conversations processed in parallel.
-# Each conversation sends two requests: one for usefulness and one for correctness.
+# Total number of parallel ICE requests.
+# Important: each conversation creates 2 requests:
+# one for usefulness and one for correctness.
 WORKERS = 4
 
 # LM Studio OpenAI-compatible API.
@@ -51,7 +52,7 @@ API_KEY = "lm-studio"
 USEFULNESS_MODEL = "google/gemma-4-12b-qat"
 CORRECTNESS_MODEL = "google/gemma-4-12b-qat"
 
-REQUEST_TIMEOUT_SECONDS = 1800
+REQUEST_TIMEOUT_SECONDS = 180
 RETRIES = 0
 RETRY_SLEEP_SECONDS = 2
 TEMPERATURE = 0.0
@@ -263,8 +264,7 @@ CODE_BLOCK_PATTERN = re.compile(
 
 def extract_code_blocks_from_response(response_text: str) -> List[str]:
     """
-    Extracts fenced code blocks from the LLM response.
-    Only triple-backtick code blocks are considered.
+    Extracts code blocks enclosed in triple backticks from the assistant response.
     """
     blocks = []
 
@@ -279,13 +279,13 @@ def extract_code_blocks_from_response(response_text: str) -> List[str]:
 
 def format_code_blocks_for_ice(code_blocks: List[str]) -> str:
     """
-    Formats multiple generated code blocks exactly as required:
+    Formats multiple generated code blocks as:
 
     [CODE BLOCK 1]
-    ...
+    code...
 
     [CODE BLOCK 2]
-    ...
+    code...
     """
     parts = []
 
@@ -347,7 +347,7 @@ def call_lm_studio(prompt: str, model: str) -> str:
         "temperature": TEMPERATURE,
     }
 
-    headers = {
+    headers: Dict[str, str] = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {API_KEY}",
     }
@@ -380,11 +380,10 @@ def call_lm_studio(prompt: str, model: str) -> str:
 def extract_score_from_raw_response(raw_content: str, aspect: str) -> int:
     """
     Rule-based score extraction inspired by the original ICE-Score repository.
-    Expected output is a score from 0 to 4.
+    Expected score: integer from 0 to 4.
     """
     content = safe_text(raw_content).strip()
 
-    # Ideal case: the model returns only "0", "1", "2", "3", or "4".
     if re.fullmatch(r"[0-4]", content):
         return int(content)
 
@@ -400,25 +399,30 @@ def extract_score_from_raw_response(raw_content: str, aspect: str) -> int:
     }.get(aspect, ["score"])
 
     relevant_lines = [
-        line for line in normalized_lines
+        line
+        for line in normalized_lines
         if any(term in line for term in aspect_terms)
     ]
 
-    # Prefer explicit expressions such as "3 out of 4", "3/4", or "score: 3".
     for line in relevant_lines + normalized_lines:
         match = re.search(r"\b([0-4])\s*(?:/|out of)\s*4\b", line)
+
         if match:
             return int(match.group(1))
 
-        match = re.search(r"(?:score|usefulness|correctness|functional)\D{0,40}\b([0-4])\b", line)
+        match = re.search(
+            r"(?:score|usefulness|correctness|functional)\D{0,40}\b([0-4])\b",
+            line,
+        )
+
         if match:
             return int(match.group(1))
 
         match = re.match(r"^\s*([0-4])\b", line)
+
         if match:
             return int(match.group(1))
 
-    # Last fallback: collect all standalone 0-4 digits and use the most frequent one.
     candidates = re.findall(r"\b([0-4])\b", content)
 
     if candidates:
@@ -433,7 +437,11 @@ def evaluate_ice_aspect(
     output: str,
     aspect: str,
     model: str,
-) -> Tuple[int, str]:
+) -> Dict[str, Any]:
+    """
+    Evaluates one ICE aspect for one conversation.
+    This function is submitted as an independent parallel job.
+    """
     prompt = build_ice_prompt(
         problem=problem,
         output=output,
@@ -459,11 +467,16 @@ def evaluate_ice_aspect(
     if not is_valid_score(score):
         raise ValueError(f"Invalid {aspect} score: {score}")
 
-    return score, raw_response
+    return {
+        "conversation_id": conversation_id,
+        "aspect": aspect,
+        "score": score,
+        "raw_response": raw_response,
+    }
 
 
 # ============================================================
-# Intent classification input
+# Task classification input
 # ============================================================
 
 def load_target_conversation_ids() -> Set[str]:
@@ -494,8 +507,6 @@ def load_target_conversation_ids() -> Set[str]:
             task = safe_text(obj.get("task")).strip().upper()
             status = safe_text(obj.get("status")).strip()
 
-            # If status exists, keep only successful classifications.
-            # This also supports older files without status.
             if status and status != "ok":
                 continue
 
@@ -606,7 +617,7 @@ def collect_rows_to_process(
 
 
 # ============================================================
-# Output records
+# Conversation preparation
 # ============================================================
 
 def make_error_record(
@@ -623,13 +634,14 @@ def make_error_record(
     }
 
 
-def process_row(row: Dict[str, Any]) -> Dict[str, Any]:
+def prepare_conversation_for_ice(row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Extracts the original prompt and generated code blocks from one conversation.
+    Returns:
+    - prepared item if successful
+    - error record if preparation fails
+    """
     conversation_id = safe_text(row.get("conversation_id")).strip()
-
-    usefulness_score: Optional[int] = None
-    correctness_score: Optional[int] = None
-    raw_usefulness: Optional[str] = None
-    raw_correctness: Optional[str] = None
 
     try:
         conversation = row["conversation"]
@@ -650,48 +662,132 @@ def process_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
         output = format_code_blocks_for_ice(code_blocks)
 
-        usefulness_score, raw_usefulness = evaluate_ice_aspect(
+        prepared_item = {
+            "conversation_id": conversation_id,
+            "problem": problem,
+            "output": output,
+            "code_block_count": len(code_blocks),
+        }
+
+        return prepared_item, None
+
+    except Exception as exc:
+        return None, make_error_record(
             conversation_id=conversation_id,
-            problem=problem,
-            output=output,
-            aspect="usefulness",
-            model=USEFULNESS_MODEL,
+            error=exc,
         )
 
-        correctness_score, raw_correctness = evaluate_ice_aspect(
-            conversation_id=conversation_id,
-            problem=problem,
-            output=output,
-            aspect="correctness",
-            model=CORRECTNESS_MODEL,
-        )
 
+# ============================================================
+# Parallel ICE execution
+# ============================================================
+
+def build_final_record_from_aspects(
+    conversation_id: str,
+    aspect_results: Dict[str, Dict[str, Any]],
+    aspect_errors: Dict[str, str],
+) -> Dict[str, Any]:
+    usefulness_score = None
+    correctness_score = None
+
+    raw_usefulness = None
+    raw_correctness = None
+
+    if "usefulness" in aspect_results:
+        usefulness_score = aspect_results["usefulness"]["score"]
+        raw_usefulness = aspect_results["usefulness"]["raw_response"]
+
+    if "correctness" in aspect_results:
+        correctness_score = aspect_results["correctness"]["score"]
+        raw_correctness = aspect_results["correctness"]["raw_response"]
+
+    if (
+        not aspect_errors
+        and is_valid_score(usefulness_score)
+        and is_valid_score(correctness_score)
+    ):
         record: Dict[str, Any] = {
             "conversation_id": conversation_id,
             "usefulness": usefulness_score,
             "correctness": correctness_score,
             "status": "ok",
         }
+    else:
+        error_parts = []
 
-        if SAVE_RAW_RESPONSES:
-            record["raw_usefulness_response"] = raw_usefulness
-            record["raw_correctness_response"] = raw_correctness
+        if "usefulness" in aspect_errors:
+            error_parts.append(f"usefulness={aspect_errors['usefulness']}")
 
-        return record
+        if "correctness" in aspect_errors:
+            error_parts.append(f"correctness={aspect_errors['correctness']}")
 
-    except Exception as exc:
-        record = make_error_record(
-            conversation_id=conversation_id,
-            error=exc,
-            usefulness=usefulness_score,
-            correctness=correctness_score,
+        if not is_valid_score(usefulness_score):
+            error_parts.append("usefulness_score_missing_or_invalid")
+
+        if not is_valid_score(correctness_score):
+            error_parts.append("correctness_score_missing_or_invalid")
+
+        record = {
+            "conversation_id": conversation_id,
+            "usefulness": usefulness_score,
+            "correctness": correctness_score,
+            "status": "Error: " + "; ".join(error_parts),
+        }
+
+    if SAVE_RAW_RESPONSES:
+        record["raw_usefulness_response"] = raw_usefulness
+        record["raw_correctness_response"] = raw_correctness
+
+    return record
+
+
+def submit_ice_jobs(
+    executor: ThreadPoolExecutor,
+    prepared_items: List[Dict[str, Any]],
+) -> Dict[Any, Dict[str, str]]:
+    """
+    Submits two independent jobs for every conversation:
+    - usefulness
+    - correctness
+
+    This is the key point: the two model calls are now truly parallel.
+    """
+    future_to_metadata = {}
+
+    for item in prepared_items:
+        conversation_id = item["conversation_id"]
+        problem = item["problem"]
+        output = item["output"]
+
+        usefulness_future = executor.submit(
+            evaluate_ice_aspect,
+            conversation_id,
+            problem,
+            output,
+            "usefulness",
+            USEFULNESS_MODEL,
         )
 
-        if SAVE_RAW_RESPONSES:
-            record["raw_usefulness_response"] = raw_usefulness
-            record["raw_correctness_response"] = raw_correctness
+        future_to_metadata[usefulness_future] = {
+            "conversation_id": conversation_id,
+            "aspect": "usefulness",
+        }
 
-        return record
+        correctness_future = executor.submit(
+            evaluate_ice_aspect,
+            conversation_id,
+            problem,
+            output,
+            "correctness",
+            CORRECTNESS_MODEL,
+        )
+
+        future_to_metadata[correctness_future] = {
+            "conversation_id": conversation_id,
+            "aspect": "correctness",
+        }
+
+    return future_to_metadata
 
 
 # ============================================================
@@ -722,37 +818,89 @@ def main() -> None:
         print(f"Output: {OUTPUT_JSONL}")
         return
 
+    prepared_items: List[Dict[str, Any]] = []
+    preparation_error_records: List[Dict[str, Any]] = []
+
+    for row in tqdm(rows_to_process, desc="Preparing conversations"):
+        prepared_item, error_record = prepare_conversation_for_ice(row)
+
+        if prepared_item is not None:
+            prepared_items.append(prepared_item)
+
+        if error_record is not None:
+            preparation_error_records.append(error_record)
+
     written = 0
     errors = 0
 
-    with ThreadPoolExecutor(max_workers=max(1, int(WORKERS))) as executor:
-        future_to_conversation_id = {}
+    for record in preparation_error_records:
+        write_jsonl(OUTPUT_JSONL, record)
+        written += 1
+        errors += 1
 
-        for row in rows_to_process:
-            conversation_id = safe_text(row.get("conversation_id")).strip()
-            future = executor.submit(process_row, row)
-            future_to_conversation_id[future] = conversation_id
+    if not prepared_items:
+        print(f"Written: {written}")
+        print(f"Errors: {errors}")
+        print(f"Output: {OUTPUT_JSONL}")
+        return
+
+    aspect_results_by_conversation: Dict[str, Dict[str, Dict[str, Any]]] = {
+        item["conversation_id"]: {}
+        for item in prepared_items
+    }
+
+    aspect_errors_by_conversation: Dict[str, Dict[str, str]] = {
+        item["conversation_id"]: {}
+        for item in prepared_items
+    }
+
+    completed_aspects_by_conversation: Dict[str, Set[str]] = {
+        item["conversation_id"]: set()
+        for item in prepared_items
+    }
+
+    written_conversation_ids: Set[str] = set()
+
+    with ThreadPoolExecutor(max_workers=max(1, int(WORKERS))) as executor:
+        future_to_metadata = submit_ice_jobs(
+            executor=executor,
+            prepared_items=prepared_items,
+        )
 
         for future in tqdm(
-            as_completed(future_to_conversation_id),
-            total=len(future_to_conversation_id),
-            desc="Computing ICE-Score",
+            as_completed(future_to_metadata),
+            total=len(future_to_metadata),
+            desc="Computing ICE-Score aspects",
         ):
-            conversation_id = future_to_conversation_id[future]
+            metadata = future_to_metadata[future]
+            conversation_id = metadata["conversation_id"]
+            aspect = metadata["aspect"]
 
             try:
-                record = future.result()
+                result = future.result()
+                aspect_results_by_conversation[conversation_id][aspect] = result
+
             except Exception as exc:
-                record = make_error_record(
+                aspect_errors_by_conversation[conversation_id][aspect] = safe_text(exc)
+
+            completed_aspects_by_conversation[conversation_id].add(aspect)
+
+            if completed_aspects_by_conversation[conversation_id] == {"usefulness", "correctness"}:
+                if conversation_id in written_conversation_ids:
+                    continue
+
+                record = build_final_record_from_aspects(
                     conversation_id=conversation_id,
-                    error=exc,
+                    aspect_results=aspect_results_by_conversation[conversation_id],
+                    aspect_errors=aspect_errors_by_conversation[conversation_id],
                 )
 
-            if safe_text(record.get("status")).startswith("Error:"):
-                errors += 1
+                if safe_text(record.get("status")).startswith("Error:"):
+                    errors += 1
 
-            write_jsonl(OUTPUT_JSONL, record)
-            written += 1
+                write_jsonl(OUTPUT_JSONL, record)
+                written += 1
+                written_conversation_ids.add(conversation_id)
 
     print(f"Written: {written}")
     print(f"Errors: {errors}")
