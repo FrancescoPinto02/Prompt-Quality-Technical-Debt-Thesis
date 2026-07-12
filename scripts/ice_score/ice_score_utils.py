@@ -11,65 +11,11 @@ import requests
 from tqdm import tqdm
 
 
-# ============================================================
-# Configuration
-# ============================================================
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-FINAL_DATASET_DIR = PROJECT_ROOT / "data/final/v1"
-
-TASK_CLASSIFICATION_JSONL = (
-    PROJECT_ROOT
-    / "data/intent_classification/task_classification.jsonl"
-)
-
-OUTPUT_JSONL = PROJECT_ROOT / "data/ice_score/ice_score.jsonl"
-
-# Only conversations classified with one of these task labels are evaluated.
-TARGET_TASKS = {
-    "CODE_GENERATION",
-    "CODE_MODIFICATION",
-    "ISSUE_RESOLVING",
-}
-
-MAX_FILES: Optional[int] = None
-MAX_CONVERSATIONS: Optional[int] = None
-
-OVERWRITE_OUTPUT = False
-RESUME = True
-
-# Total number of parallel ICE requests.
-# Important: each conversation creates 2 requests:
-# one for usefulness and one for correctness.
-WORKERS = 4
-
-# LM Studio OpenAI-compatible API.
-API_BASE = "http://localhost:1234/v1"
-API_KEY = "lm-studio"
-
-# The two ICE aspects can use different models.
-USEFULNESS_MODEL = "google/gemma-4-12b-qat"
-CORRECTNESS_MODEL = "google/gemma-4-12b-qat"
-
-REQUEST_TIMEOUT_SECONDS = 180
-RETRIES = 0
-RETRY_SLEEP_SECONDS = 2
-TEMPERATURE = 0.0
-
-# The original ICE implementation sends the full evaluation prompt as a system message.
-# If a local model behaves better with user messages, change this to "user".
-ICE_PROMPT_ROLE = "system"
-
-# Optional output/debug controls.
-SAVE_DEBUG_PROMPTS = False
-DEBUG_PROMPTS_DIR = PROJECT_ROOT / "data/ice_score/debug"
-
-SAVE_RAW_RESPONSES = False
-
 
 # ============================================================
-# ICE-Score prompts
+# ICE prompt templates
 # ============================================================
 
 ICE_CORRECTNESS_PROMPT_TEMPLATE = """\
@@ -99,7 +45,8 @@ Functional Correctness (0-4) - Execution-based quality of the code snippet combi
 {{OUTPUT}}
 
 ##### EVALUATION FORM #####
-Functional Correctness (scores ONLY):
+Functional Correctness
+Step-by-step Evaluation:
 """
 
 
@@ -128,12 +75,13 @@ Usefulness (0-4) Usefulness of the code snippet based on the problem description
 
 {{PROBLEM}}
 
-##### CODE SNIPPET #####
+##### CODE SNIPPETS #####
 
 {{OUTPUT}}
 
 ##### EVALUATION FORM #####
-Usefulness (scores ONLY):
+Usefulness
+Step-by-step Evaluation:
 """
 
 
@@ -158,9 +106,9 @@ def write_jsonl(path: Path, record: Dict[str, Any]) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def clean_output() -> None:
-    if OVERWRITE_OUTPUT and OUTPUT_JSONL.exists():
-        OUTPUT_JSONL.unlink()
+def clean_output(output_jsonl: Path, overwrite_output: bool) -> None:
+    if overwrite_output and output_jsonl.exists():
+        output_jsonl.unlink()
 
 
 def to_python(value: Any) -> Any:
@@ -264,7 +212,7 @@ CODE_BLOCK_PATTERN = re.compile(
 
 def extract_code_blocks_from_response(response_text: str) -> List[str]:
     """
-    Extracts code blocks enclosed in triple backticks from the assistant response.
+    Extracts only code blocks enclosed in triple backticks.
     """
     blocks = []
 
@@ -279,7 +227,7 @@ def extract_code_blocks_from_response(response_text: str) -> List[str]:
 
 def format_code_blocks_for_ice(code_blocks: List[str]) -> str:
     """
-    Formats multiple generated code blocks as:
+    Formats multiple generated code blocks as requested:
 
     [CODE BLOCK 1]
     code...
@@ -296,14 +244,14 @@ def format_code_blocks_for_ice(code_blocks: List[str]) -> str:
 
 
 # ============================================================
-# ICE prompt construction
+# ICE prompt and score extraction
 # ============================================================
 
 def build_ice_prompt(problem: str, output: str, aspect: str) -> str:
-    if aspect == "usefulness":
-        template = ICE_USEFULNESS_PROMPT_TEMPLATE
-    elif aspect == "correctness":
+    if aspect == "correctness":
         template = ICE_CORRECTNESS_PROMPT_TEMPLATE
+    elif aspect == "usefulness":
+        template = ICE_USEFULNESS_PROMPT_TEMPLATE
     else:
         raise ValueError(f"Unknown ICE aspect: {aspect}")
 
@@ -314,72 +262,9 @@ def build_ice_prompt(problem: str, output: str, aspect: str) -> str:
     )
 
 
-def save_debug_prompt(
-    conversation_id: str,
-    aspect: str,
-    prompt: str,
-) -> None:
-    if not SAVE_DEBUG_PROMPTS:
-        return
-
-    conversation_dir = DEBUG_PROMPTS_DIR / safe_filename(conversation_id)
-    conversation_dir.mkdir(parents=True, exist_ok=True)
-
-    path = conversation_dir / f"{aspect}_prompt.txt"
-    path.write_text(prompt, encoding="utf-8")
-
-
-# ============================================================
-# LM Studio API and score extraction
-# ============================================================
-
-def call_lm_studio(prompt: str, model: str) -> str:
-    url = API_BASE.rstrip("/") + "/chat/completions"
-
-    payload: Dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {
-                "role": ICE_PROMPT_ROLE,
-                "content": prompt,
-            }
-        ],
-        "temperature": TEMPERATURE,
-    }
-
-    headers: Dict[str, str] = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {API_KEY}",
-    }
-
-    last_error: Optional[Exception] = None
-
-    for attempt in range(RETRIES + 1):
-        try:
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-            return safe_text(data["choices"][0]["message"]["content"]).strip()
-
-        except Exception as exc:
-            last_error = exc
-
-            if attempt < RETRIES:
-                time.sleep(RETRY_SLEEP_SECONDS)
-
-    raise RuntimeError(f"LM Studio request failed: {last_error}")
-
-
 def extract_score_from_raw_response(raw_content: str, aspect: str) -> int:
     """
-    Rule-based score extraction inspired by the original ICE-Score repository.
+    Rule-based extraction inspired by the ICE-Score repository.
     Expected score: integer from 0 to 4.
     """
     content = safe_text(raw_content).strip()
@@ -431,67 +316,83 @@ def extract_score_from_raw_response(raw_content: str, aspect: str) -> int:
     raise ValueError(f"Could not extract score from response: {content[:500]}")
 
 
-def evaluate_ice_aspect(
-    conversation_id: str,
-    problem: str,
-    output: str,
-    aspect: str,
+# ============================================================
+# LM Studio
+# ============================================================
+
+def call_lm_studio(
+    prompt: str,
+    api_base: str,
+    api_key: str,
     model: str,
-) -> Dict[str, Any]:
-    """
-    Evaluates one ICE aspect for one conversation.
-    This function is submitted as an independent parallel job.
-    """
-    prompt = build_ice_prompt(
-        problem=problem,
-        output=output,
-        aspect=aspect,
-    )
+    prompt_role: str,
+    temperature: float,
+    request_timeout_seconds: int,
+    retries: int,
+    retry_sleep_seconds: int,
+) -> str:
+    url = api_base.rstrip("/") + "/chat/completions"
 
-    save_debug_prompt(
-        conversation_id=conversation_id,
-        aspect=aspect,
-        prompt=prompt,
-    )
-
-    raw_response = call_lm_studio(
-        prompt=prompt,
-        model=model,
-    )
-
-    score = extract_score_from_raw_response(
-        raw_content=raw_response,
-        aspect=aspect,
-    )
-
-    if not is_valid_score(score):
-        raise ValueError(f"Invalid {aspect} score: {score}")
-
-    return {
-        "conversation_id": conversation_id,
-        "aspect": aspect,
-        "score": score,
-        "raw_response": raw_response,
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": prompt_role,
+                "content": prompt,
+            }
+        ],
+        "temperature": temperature,
     }
 
+    headers: Dict[str, str] = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    last_error: Optional[Exception] = None
+
+    for attempt in range(retries + 1):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=request_timeout_seconds,
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+            return safe_text(data["choices"][0]["message"]["content"]).strip()
+
+        except Exception as exc:
+            last_error = exc
+
+            if attempt < retries:
+                time.sleep(retry_sleep_seconds)
+
+    raise RuntimeError(f"LM Studio request failed: {last_error}")
+
 
 # ============================================================
-# Task classification input
+# Input IDs from task classification
 # ============================================================
 
-def load_target_conversation_ids() -> Set[str]:
+def load_target_conversation_ids(
+    task_classification_jsonl: Path,
+    target_tasks: Set[str],
+) -> Set[str]:
     """
-    Reads the task classification JSONL and returns conversation IDs whose
-    predicted task belongs to TARGET_TASKS.
+    Reads task classification output and returns IDs with selected task labels.
     """
-    if not TASK_CLASSIFICATION_JSONL.exists():
+    if not task_classification_jsonl.exists():
         raise FileNotFoundError(
-            f"Task classification JSONL not found: {TASK_CLASSIFICATION_JSONL}"
+            f"Task classification JSONL not found: {task_classification_jsonl}"
         )
 
     target_ids = set()
 
-    with TASK_CLASSIFICATION_JSONL.open("r", encoding="utf-8") as f:
+    with task_classification_jsonl.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
 
@@ -510,19 +411,23 @@ def load_target_conversation_ids() -> Set[str]:
             if status and status != "ok":
                 continue
 
-            if conversation_id and task in TARGET_TASKS:
+            if conversation_id and task in target_tasks:
                 target_ids.add(conversation_id)
 
     return target_ids
 
 
-def load_completed_conversation_ids() -> Set[str]:
+def load_completed_conversation_ids(
+    output_jsonl: Path,
+    score_field: str,
+    resume: bool,
+) -> Set[str]:
     completed = set()
 
-    if not RESUME or not OUTPUT_JSONL.exists():
+    if not resume or not output_jsonl.exists():
         return completed
 
-    with OUTPUT_JSONL.open("r", encoding="utf-8") as f:
+    with output_jsonl.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
 
@@ -536,16 +441,9 @@ def load_completed_conversation_ids() -> Set[str]:
 
             conversation_id = safe_text(obj.get("conversation_id")).strip()
             status = safe_text(obj.get("status")).strip()
+            score = obj.get(score_field)
 
-            usefulness = obj.get("usefulness")
-            correctness = obj.get("correctness")
-
-            if (
-                conversation_id
-                and status == "ok"
-                and is_valid_score(usefulness)
-                and is_valid_score(correctness)
-            ):
+            if conversation_id and status == "ok" and is_valid_score(score):
                 completed.add(conversation_id)
 
     return completed
@@ -555,21 +453,27 @@ def load_completed_conversation_ids() -> Set[str]:
 # Dataset loading
 # ============================================================
 
-def load_parquet_files() -> List[Path]:
-    parquet_files = sorted(FINAL_DATASET_DIR.glob("*.parquet"))
+def load_parquet_files(
+    final_dataset_dir: Path,
+    max_files: Optional[int],
+) -> List[Path]:
+    parquet_files = sorted(final_dataset_dir.glob("*.parquet"))
 
-    if MAX_FILES is not None:
-        parquet_files = parquet_files[:MAX_FILES]
+    if max_files is not None:
+        parquet_files = parquet_files[:max_files]
 
     if not parquet_files:
-        raise FileNotFoundError(f"No parquet files found in: {FINAL_DATASET_DIR}")
+        raise FileNotFoundError(f"No parquet files found in: {final_dataset_dir}")
 
     return parquet_files
 
 
 def collect_rows_to_process(
+    final_dataset_dir: Path,
     target_ids: Set[str],
     completed_ids: Set[str],
+    max_files: Optional[int],
+    max_conversations: Optional[int],
 ) -> List[Dict[str, Any]]:
     ids_to_find = target_ids - completed_ids
 
@@ -579,7 +483,10 @@ def collect_rows_to_process(
     rows_to_process: List[Dict[str, Any]] = []
     found_ids = set()
 
-    parquet_files = load_parquet_files()
+    parquet_files = load_parquet_files(
+        final_dataset_dir=final_dataset_dir,
+        max_files=max_files,
+    )
 
     for parquet_path in tqdm(parquet_files, desc="Loading final dataset"):
         df = pd.read_parquet(parquet_path)
@@ -598,7 +505,6 @@ def collect_rows_to_process(
 
         df = df.copy()
         df["conversation_id"] = df["conversation_id"].astype(str)
-
         df = df[df["conversation_id"].isin(ids_to_find)]
 
         for _, row in df.iterrows():
@@ -610,36 +516,60 @@ def collect_rows_to_process(
             rows_to_process.append(row.to_dict())
             found_ids.add(conversation_id)
 
-            if MAX_CONVERSATIONS is not None and len(rows_to_process) >= MAX_CONVERSATIONS:
+            if max_conversations is not None and len(rows_to_process) >= max_conversations:
                 return rows_to_process
 
     return rows_to_process
 
 
 # ============================================================
-# Conversation preparation
+# ICE aspect pipeline
 # ============================================================
 
 def make_error_record(
     conversation_id: str,
+    score_field: str,
     error: Any,
-    usefulness: Optional[int] = None,
-    correctness: Optional[int] = None,
 ) -> Dict[str, Any]:
     return {
         "conversation_id": conversation_id,
-        "usefulness": usefulness,
-        "correctness": correctness,
+        score_field: None,
         "status": f"Error: {safe_text(error)}",
     }
 
 
-def prepare_conversation_for_ice(row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+def save_debug_prompt(
+    debug_prompts_dir: Path,
+    conversation_id: str,
+    aspect: str,
+    prompt: str,
+) -> None:
+    conversation_dir = debug_prompts_dir / safe_filename(conversation_id)
+    conversation_dir.mkdir(parents=True, exist_ok=True)
+
+    path = conversation_dir / f"{aspect}_prompt.txt"
+    path.write_text(prompt, encoding="utf-8")
+
+
+def evaluate_row_for_aspect(
+    row: Dict[str, Any],
+    aspect: str,
+    score_field: str,
+    api_base: str,
+    api_key: str,
+    model: str,
+    prompt_role: str,
+    temperature: float,
+    request_timeout_seconds: int,
+    retries: int,
+    retry_sleep_seconds: int,
+    save_debug_prompts: bool,
+    debug_prompts_dir: Path,
+    save_raw_responses: bool,
+) -> Dict[str, Any]:
     """
-    Extracts the original prompt and generated code blocks from one conversation.
-    Returns:
-    - prepared item if successful
-    - error record if preparation fails
+    Extracts prompt and generated code blocks, builds the ICE prompt,
+    sends one request to LM Studio, and returns one JSONL record.
     """
     conversation_id = safe_text(row.get("conversation_id")).strip()
 
@@ -662,250 +592,171 @@ def prepare_conversation_for_ice(row: Dict[str, Any]) -> Tuple[Optional[Dict[str
 
         output = format_code_blocks_for_ice(code_blocks)
 
-        prepared_item = {
+        prompt = build_ice_prompt(
+            problem=problem,
+            output=output,
+            aspect=aspect,
+        )
+
+        if save_debug_prompts:
+            save_debug_prompt(
+                debug_prompts_dir=debug_prompts_dir,
+                conversation_id=conversation_id,
+                aspect=aspect,
+                prompt=prompt,
+            )
+
+        raw_response = call_lm_studio(
+            prompt=prompt,
+            api_base=api_base,
+            api_key=api_key,
+            model=model,
+            prompt_role=prompt_role,
+            temperature=temperature,
+            request_timeout_seconds=request_timeout_seconds,
+            retries=retries,
+            retry_sleep_seconds=retry_sleep_seconds,
+        )
+
+        score = extract_score_from_raw_response(
+            raw_content=raw_response,
+            aspect=aspect,
+        )
+
+        if not is_valid_score(score):
+            raise ValueError(f"Invalid {aspect} score: {score}")
+
+        record: Dict[str, Any] = {
             "conversation_id": conversation_id,
-            "problem": problem,
-            "output": output,
-            "code_block_count": len(code_blocks),
+            score_field: score,
+            "status": "ok",
         }
 
-        return prepared_item, None
+        if save_raw_responses:
+            record[f"raw_{score_field}_response"] = raw_response
+
+        return record
 
     except Exception as exc:
-        return None, make_error_record(
+        return make_error_record(
             conversation_id=conversation_id,
+            score_field=score_field,
             error=exc,
         )
 
 
-# ============================================================
-# Parallel ICE execution
-# ============================================================
-
-def build_final_record_from_aspects(
-    conversation_id: str,
-    aspect_results: Dict[str, Dict[str, Any]],
-    aspect_errors: Dict[str, str],
-) -> Dict[str, Any]:
-    usefulness_score = None
-    correctness_score = None
-
-    raw_usefulness = None
-    raw_correctness = None
-
-    if "usefulness" in aspect_results:
-        usefulness_score = aspect_results["usefulness"]["score"]
-        raw_usefulness = aspect_results["usefulness"]["raw_response"]
-
-    if "correctness" in aspect_results:
-        correctness_score = aspect_results["correctness"]["score"]
-        raw_correctness = aspect_results["correctness"]["raw_response"]
-
-    if (
-        not aspect_errors
-        and is_valid_score(usefulness_score)
-        and is_valid_score(correctness_score)
-    ):
-        record: Dict[str, Any] = {
-            "conversation_id": conversation_id,
-            "usefulness": usefulness_score,
-            "correctness": correctness_score,
-            "status": "ok",
-        }
-    else:
-        error_parts = []
-
-        if "usefulness" in aspect_errors:
-            error_parts.append(f"usefulness={aspect_errors['usefulness']}")
-
-        if "correctness" in aspect_errors:
-            error_parts.append(f"correctness={aspect_errors['correctness']}")
-
-        if not is_valid_score(usefulness_score):
-            error_parts.append("usefulness_score_missing_or_invalid")
-
-        if not is_valid_score(correctness_score):
-            error_parts.append("correctness_score_missing_or_invalid")
-
-        record = {
-            "conversation_id": conversation_id,
-            "usefulness": usefulness_score,
-            "correctness": correctness_score,
-            "status": "Error: " + "; ".join(error_parts),
-        }
-
-    if SAVE_RAW_RESPONSES:
-        record["raw_usefulness_response"] = raw_usefulness
-        record["raw_correctness_response"] = raw_correctness
-
-    return record
-
-
-def submit_ice_jobs(
-    executor: ThreadPoolExecutor,
-    prepared_items: List[Dict[str, Any]],
-) -> Dict[Any, Dict[str, str]]:
-    """
-    Submits two independent jobs for every conversation:
-    - usefulness
-    - correctness
-
-    This is the key point: the two model calls are now truly parallel.
-    """
-    future_to_metadata = {}
-
-    for item in prepared_items:
-        conversation_id = item["conversation_id"]
-        problem = item["problem"]
-        output = item["output"]
-
-        usefulness_future = executor.submit(
-            evaluate_ice_aspect,
-            conversation_id,
-            problem,
-            output,
-            "usefulness",
-            USEFULNESS_MODEL,
-        )
-
-        future_to_metadata[usefulness_future] = {
-            "conversation_id": conversation_id,
-            "aspect": "usefulness",
-        }
-
-        correctness_future = executor.submit(
-            evaluate_ice_aspect,
-            conversation_id,
-            problem,
-            output,
-            "correctness",
-            CORRECTNESS_MODEL,
-        )
-
-        future_to_metadata[correctness_future] = {
-            "conversation_id": conversation_id,
-            "aspect": "correctness",
-        }
-
-    return future_to_metadata
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def main() -> None:
-    OUTPUT_JSONL.parent.mkdir(parents=True, exist_ok=True)
-    clean_output()
-
-    target_ids = load_target_conversation_ids()
-    completed_ids = load_completed_conversation_ids()
-
-    rows_to_process = collect_rows_to_process(
-        target_ids=target_ids,
-        completed_ids=completed_ids,
+def run_ice_aspect_pipeline(
+    aspect: str,
+    score_field: str,
+    final_dataset_dir: Path,
+    task_classification_jsonl: Path,
+    output_jsonl: Path,
+    target_tasks: Set[str],
+    max_files: Optional[int],
+    max_conversations: Optional[int],
+    overwrite_output: bool,
+    resume: bool,
+    workers: int,
+    api_base: str,
+    api_key: str,
+    model: str,
+    prompt_role: str,
+    temperature: float,
+    request_timeout_seconds: int,
+    retries: int,
+    retry_sleep_seconds: int,
+    save_debug_prompts: bool,
+    debug_prompts_dir: Path,
+    save_raw_responses: bool,
+) -> None:
+    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    clean_output(
+        output_jsonl=output_jsonl,
+        overwrite_output=overwrite_output,
     )
 
-    print(f"Target tasks: {sorted(TARGET_TASKS)}")
-    print(f"Target conversation IDs from task classification: {len(target_ids)}")
+    target_ids = load_target_conversation_ids(
+        task_classification_jsonl=task_classification_jsonl,
+        target_tasks=target_tasks,
+    )
+
+    completed_ids = load_completed_conversation_ids(
+        output_jsonl=output_jsonl,
+        score_field=score_field,
+        resume=resume,
+    )
+
+    rows_to_process = collect_rows_to_process(
+        final_dataset_dir=final_dataset_dir,
+        target_ids=target_ids,
+        completed_ids=completed_ids,
+        max_files=max_files,
+        max_conversations=max_conversations,
+    )
+
+    print(f"Aspect: {aspect}")
+    print(f"Target tasks: {sorted(target_tasks)}")
+    print(f"Target conversation IDs: {len(target_ids)}")
     print(f"Completed by resume: {len(completed_ids)}")
     print(f"Rows to process: {len(rows_to_process)}")
-    print(f"Workers: {WORKERS}")
-    print(f"Usefulness model: {USEFULNESS_MODEL}")
-    print(f"Correctness model: {CORRECTNESS_MODEL}")
+    print(f"Workers: {workers}")
+    print(f"Model: {model}")
+    print(f"Output: {output_jsonl}")
 
     if not rows_to_process:
-        print(f"Output: {OUTPUT_JSONL}")
         return
-
-    prepared_items: List[Dict[str, Any]] = []
-    preparation_error_records: List[Dict[str, Any]] = []
-
-    for row in tqdm(rows_to_process, desc="Preparing conversations"):
-        prepared_item, error_record = prepare_conversation_for_ice(row)
-
-        if prepared_item is not None:
-            prepared_items.append(prepared_item)
-
-        if error_record is not None:
-            preparation_error_records.append(error_record)
 
     written = 0
     errors = 0
 
-    for record in preparation_error_records:
-        write_jsonl(OUTPUT_JSONL, record)
-        written += 1
-        errors += 1
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
+        future_to_conversation_id = {}
 
-    if not prepared_items:
-        print(f"Written: {written}")
-        print(f"Errors: {errors}")
-        print(f"Output: {OUTPUT_JSONL}")
-        return
+        for row in rows_to_process:
+            conversation_id = safe_text(row.get("conversation_id")).strip()
 
-    aspect_results_by_conversation: Dict[str, Dict[str, Dict[str, Any]]] = {
-        item["conversation_id"]: {}
-        for item in prepared_items
-    }
+            future = executor.submit(
+                evaluate_row_for_aspect,
+                row,
+                aspect,
+                score_field,
+                api_base,
+                api_key,
+                model,
+                prompt_role,
+                temperature,
+                request_timeout_seconds,
+                retries,
+                retry_sleep_seconds,
+                save_debug_prompts,
+                debug_prompts_dir,
+                save_raw_responses,
+            )
 
-    aspect_errors_by_conversation: Dict[str, Dict[str, str]] = {
-        item["conversation_id"]: {}
-        for item in prepared_items
-    }
-
-    completed_aspects_by_conversation: Dict[str, Set[str]] = {
-        item["conversation_id"]: set()
-        for item in prepared_items
-    }
-
-    written_conversation_ids: Set[str] = set()
-
-    with ThreadPoolExecutor(max_workers=max(1, int(WORKERS))) as executor:
-        future_to_metadata = submit_ice_jobs(
-            executor=executor,
-            prepared_items=prepared_items,
-        )
+            future_to_conversation_id[future] = conversation_id
 
         for future in tqdm(
-            as_completed(future_to_metadata),
-            total=len(future_to_metadata),
-            desc="Computing ICE-Score aspects",
+            as_completed(future_to_conversation_id),
+            total=len(future_to_conversation_id),
+            desc=f"Computing ICE {aspect}",
         ):
-            metadata = future_to_metadata[future]
-            conversation_id = metadata["conversation_id"]
-            aspect = metadata["aspect"]
+            conversation_id = future_to_conversation_id[future]
 
             try:
-                result = future.result()
-                aspect_results_by_conversation[conversation_id][aspect] = result
-
+                record = future.result()
             except Exception as exc:
-                aspect_errors_by_conversation[conversation_id][aspect] = safe_text(exc)
-
-            completed_aspects_by_conversation[conversation_id].add(aspect)
-
-            if completed_aspects_by_conversation[conversation_id] == {"usefulness", "correctness"}:
-                if conversation_id in written_conversation_ids:
-                    continue
-
-                record = build_final_record_from_aspects(
+                record = make_error_record(
                     conversation_id=conversation_id,
-                    aspect_results=aspect_results_by_conversation[conversation_id],
-                    aspect_errors=aspect_errors_by_conversation[conversation_id],
+                    score_field=score_field,
+                    error=exc,
                 )
 
-                if safe_text(record.get("status")).startswith("Error:"):
-                    errors += 1
+            if safe_text(record.get("status")).startswith("Error:"):
+                errors += 1
 
-                write_jsonl(OUTPUT_JSONL, record)
-                written += 1
-                written_conversation_ids.add(conversation_id)
+            write_jsonl(output_jsonl, record)
+            written += 1
 
     print(f"Written: {written}")
     print(f"Errors: {errors}")
-    print(f"Output: {OUTPUT_JSONL}")
-
-
-if __name__ == "__main__":
-    main()
+    print(f"Output: {output_jsonl}")
