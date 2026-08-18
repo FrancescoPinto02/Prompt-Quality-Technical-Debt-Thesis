@@ -4,8 +4,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 from tqdm import tqdm
@@ -17,34 +18,34 @@ from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-INPUT_DIR = PROJECT_ROOT / "data/final/v1"
+FINAL_DATASET_DIR = PROJECT_ROOT / "data/final"
+
+TASK_CLASSIFICATION_JSONL = (
+    PROJECT_ROOT
+    / "data/intent_classification/task_classification.jsonl"
+)
+
 OUTPUT_DIR = PROJECT_ROOT / "data/static_analysis/v1"
 
 PMD_OUTPUT_JSONL = OUTPUT_DIR / "pmd_java.jsonl"
+PMD_PROGRESS_JSONL = OUTPUT_DIR / "pmd_java_progress.jsonl"
 
-# If True, all extracted code blocks are saved permanently for debugging.
-SAVE_EXTRACTED_SNIPPETS = True
-EXTRACTED_SNIPPETS_DIR = OUTPUT_DIR / "extracted_snippets_java"
+SAVE_EXTRACTED_SNIPPETS = False
+EXTRACTED_SNIPPETS_DIR = OUTPUT_DIR / "extracted_java_snippets"
 
-TARGET_NATURAL_LANGUAGES = {"EN"}
-
-TARGET_TASKS = {
+TARGET_TASKS: Set[str] = {
     "CODE_GENERATION",
     "CODE_MODIFICATION",
-    "REFACTORING",
-    "BUG_FIXING",
+    "ISSUE_RESOLVING",
 }
 
-# For testing one conversation only.
-# Set to None to process all conversations.
-TARGET_CONVERSATION_ID: Optional[str] = "c75ec48c14388ce4ebc9f27b9d104939"
-# TARGET_CONVERSATION_ID = "PUT_CONVERSATION_ID_HERE"
+TARGET_CONVERSATION_ID: Optional[str] = None
 
 MAX_FILES: Optional[int] = None
 MAX_CONVERSATIONS: Optional[int] = None
 MAX_SNIPPETS: Optional[int] = None
 
-OVERWRITE_OUTPUTS = False
+OVERWRITE_OUTPUTS = True
 
 PMD_TIMEOUT_SECONDS = 60
 
@@ -55,8 +56,37 @@ PMD_COMMAND: Optional[str] = None
 
 PMD_RULESET = "rulesets/java/quickstart.xml"
 
+# Optional local XML file used only to build the rule_id -> category map.
+PMD_RULESET_CATEGORY_XML_PATH = PROJECT_ROOT / "tools/pmd_rulesets/java_quickstart.xml"
+
 JAVA_LANGUAGE_TAGS = {
     "java",
+}
+
+IGNORED_PMD_RULE_IDS = {
+    "NoPackage",
+}
+
+PMD_PRIORITY_TO_LABEL = {
+    1: "high",
+    2: "medium-high",
+    3: "medium",
+    4: "low-medium",
+    5: "low",
+}
+
+PMD_RULESET_TO_CATEGORY = {
+    "best practices": "bestpractices",
+    "bestpractices": "bestpractices",
+    "code style": "codestyle",
+    "codestyle": "codestyle",
+    "design": "design",
+    "documentation": "documentation",
+    "error prone": "errorprone",
+    "errorprone": "errorprone",
+    "multithreading": "multithreading",
+    "performance": "performance",
+    "security": "security",
 }
 
 
@@ -71,7 +101,7 @@ def safe_text(value: Any) -> str:
 
 
 def safe_filename(value: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_.-]", "_", str(value))
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", safe_text(value))
 
 
 def write_jsonl(path: Path, record: Dict[str, Any]) -> None:
@@ -82,7 +112,7 @@ def write_jsonl(path: Path, record: Dict[str, Any]) -> None:
 
 
 def count_non_blank_lines(text: str) -> int:
-    return sum(1 for line in text.splitlines() if line.strip())
+    return sum(1 for line in safe_text(text).splitlines() if line.strip())
 
 
 def to_python(value: Any) -> Any:
@@ -123,6 +153,107 @@ def maybe_parse_json_string(value: Any) -> Any:
 
 
 # ============================================================
+# Resume utilities
+# ============================================================
+
+def load_completed_conversation_ids() -> Set[str]:
+    completed: Set[str] = set()
+
+    if OVERWRITE_OUTPUTS:
+        return completed
+
+    if PMD_PROGRESS_JSONL.exists():
+        with PMD_PROGRESS_JSONL.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+
+                conversation_id = safe_text(obj.get("conversation_id")).strip()
+                status = safe_text(obj.get("status")).strip()
+
+                if conversation_id and status == "done":
+                    completed.add(conversation_id)
+
+    if PMD_OUTPUT_JSONL.exists():
+        with PMD_OUTPUT_JSONL.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+
+                conversation_id = safe_text(obj.get("conversation_id")).strip()
+
+                if conversation_id:
+                    completed.add(conversation_id)
+
+    return completed
+
+
+def write_progress(
+    conversation_id: str,
+    java_snippet_count: int,
+) -> None:
+    write_jsonl(
+        PMD_PROGRESS_JSONL,
+        {
+            "conversation_id": conversation_id,
+            "status": "done",
+            "java_snippet_count": java_snippet_count,
+        },
+    )
+
+
+# ============================================================
+# Task classification loading
+# ============================================================
+
+def load_target_task_records() -> Dict[str, str]:
+    if not TASK_CLASSIFICATION_JSONL.exists():
+        raise FileNotFoundError(
+            f"Task classification JSONL not found: {TASK_CLASSIFICATION_JSONL}"
+        )
+
+    conversation_id_to_task: Dict[str, str] = {}
+
+    with TASK_CLASSIFICATION_JSONL.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line:
+                continue
+
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+
+            conversation_id = safe_text(obj.get("conversation_id")).strip()
+            task = safe_text(obj.get("task")).strip().upper()
+            status = safe_text(obj.get("status")).strip()
+
+            if status and status != "ok":
+                continue
+
+            if conversation_id and task in TARGET_TASKS:
+                conversation_id_to_task[conversation_id] = task
+
+    return conversation_id_to_task
+
+
+# ============================================================
 # Conversation parsing
 # ============================================================
 
@@ -147,7 +278,7 @@ def iter_assistant_messages(conversation: Any) -> Iterable[Dict[str, Any]]:
     for message in iter_messages(conversation):
         role = safe_text(message.get("role")).strip().lower()
 
-        if role in {"assistant", "llm", "model"}:
+        if role in {"assistant", "llm", "model", "chatgpt"}:
             yield message
 
 
@@ -155,72 +286,38 @@ def iter_assistant_messages(conversation: Any) -> Iterable[Dict[str, Any]]:
 # Code block extraction
 # ============================================================
 
-CODE_BLOCK_PATTERN = re.compile(
-    r"```([^\n`]*)\n(.*?)```",
+CODE_FENCE_RE = re.compile(
+    r"```[ \t]*([^\n\r`]*)[\r\n](.*?)```",
     flags=re.DOTALL,
 )
 
 
-def normalize_language_tag(raw_tag: str) -> str:
+def normalize_language_tag(raw_tag: Any) -> str:
     tag = safe_text(raw_tag).strip().lower()
 
     if not tag:
         return "UNKNOWN"
 
-    first_token = tag.split()[0].strip()
-    first_token = first_token.strip("{}[]()\"'`.,:;")
+    tag = tag.strip("{}[]()")
+    first_token = re.split(r"\s+", tag)[0].strip().strip("{}[]()\"'`.,:;")
+
+    if first_token.startswith("."):
+        first_token = first_token.replace(".", "", 1)
 
     if first_token in JAVA_LANGUAGE_TAGS:
         return "JAVA"
 
-    if first_token in {"python", "py", "python3"}:
-        return "PYTHON"
-
-    if first_token in {"js", "javascript", "jsx", "react", "reactjs", "node", "nodejs"}:
-        return "JAVASCRIPT"
-
-    if first_token in {"cpp", "c++", "cxx", "cc"}:
-        return "CPP"
-
-    if first_token in {"cs", "csharp", "c#"}:
-        return "CSHARP"
-
-    return first_token.upper()
-
-
-def extension_for_language(language: str) -> str:
-    mapping = {
-        "JAVA": ".java",
-        "PYTHON": ".py",
-        "JAVASCRIPT": ".js",
-        "CPP": ".cpp",
-        "CSHARP": ".cs",
-    }
-
-    return mapping.get(language, ".txt")
-
-
-def folder_for_language(language: str) -> str:
-    mapping = {
-        "JAVA": "java",
-        "PYTHON": "python",
-        "JAVASCRIPT": "javascript",
-        "CPP": "cpp",
-        "CSHARP": "csharp",
-        "UNKNOWN": "unknown",
-    }
-
-    return mapping.get(language, safe_filename(language.lower()))
+    return first_token.upper() if first_token else "UNKNOWN"
 
 
 def extract_code_blocks(conversation: Any) -> List[Dict[str, Any]]:
-    blocks = []
+    blocks: List[Dict[str, Any]] = []
     block_index = 0
 
     for message in iter_assistant_messages(conversation):
         content = safe_text(message.get("content"))
 
-        for match in CODE_BLOCK_PATTERN.finditer(content):
+        for match in CODE_FENCE_RE.finditer(content):
             raw_language_tag = match.group(1)
             code = match.group(2)
             language = normalize_language_tag(raw_language_tag)
@@ -229,7 +326,7 @@ def extract_code_blocks(conversation: Any) -> List[Dict[str, Any]]:
                 {
                     "block_index": block_index,
                     "programming_language": language,
-                    "code": code,
+                    "code": code.strip("\n\r"),
                 }
             )
 
@@ -238,45 +335,17 @@ def extract_code_blocks(conversation: Any) -> List[Dict[str, Any]]:
     return blocks
 
 
-# ============================================================
-# Snippet saving
-# ============================================================
-
-def get_block_path(
-    root_dir: Path,
-    conversation_id: str,
-    block_index: int,
-    programming_language: str,
-) -> Path:
-    conversation_dir = root_dir / safe_filename(conversation_id)
-    language_dir = conversation_dir / folder_for_language(programming_language)
-    extension = extension_for_language(programming_language)
-
-    return language_dir / f"block_{block_index:03d}{extension}"
-
-
-def save_block(
-    root_dir: Path,
-    conversation_id: str,
-    block_index: int,
-    programming_language: str,
-    code: str,
-) -> Path:
-    path = get_block_path(
-        root_dir=root_dir,
-        conversation_id=conversation_id,
-        block_index=block_index,
-        programming_language=programming_language,
-    )
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(code, encoding="utf-8")
-
-    return path
+def extract_java_blocks(conversation: Any) -> List[Dict[str, Any]]:
+    return [
+        block
+        for block in extract_code_blocks(conversation)
+        if block["programming_language"] == "JAVA"
+        and safe_text(block["code"]).strip()
+    ]
 
 
 # ============================================================
-# PMD
+# PMD command
 # ============================================================
 
 def get_pmd_executable() -> str:
@@ -296,6 +365,7 @@ def get_pmd_executable() -> str:
 
     for candidate in candidates:
         found = shutil.which(candidate)
+
         if found:
             return found
 
@@ -347,8 +417,16 @@ def run_pmd(java_files: List[Path]) -> Tuple[str, str]:
             timeout=PMD_TIMEOUT_SECONDS,
         )
 
-        stdout = completed.stdout.decode("utf-8", errors="replace") if completed.stdout else ""
-        stderr = completed.stderr.decode("utf-8", errors="replace") if completed.stderr else ""
+        stdout = (
+            completed.stdout.decode("utf-8", errors="replace")
+            if completed.stdout
+            else ""
+        )
+        stderr = (
+            completed.stderr.decode("utf-8", errors="replace")
+            if completed.stderr
+            else ""
+        )
 
         return stdout, stderr
 
@@ -359,20 +437,188 @@ def run_pmd(java_files: List[Path]) -> Tuple[str, str]:
             pass
 
 
-def filename_from_path(path_value: Any) -> str:
-    path_text = safe_text(path_value)
-    path_text = path_text.replace("\\", "/")
-    return path_text.rsplit("/", 1)[-1]
+# ============================================================
+# PMD category and priority handling
+# ============================================================
+
+def normalize_pmd_category(value: Any) -> str:
+    raw = safe_text(value).strip()
+
+    if not raw:
+        return "unknown"
+
+    normalized = raw.lower()
+    normalized = normalized.replace("_", " ")
+    normalized = normalized.replace("-", " ")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    if normalized in PMD_RULESET_TO_CATEGORY:
+        return PMD_RULESET_TO_CATEGORY[normalized]
+
+    compact = normalized.replace(" ", "")
+
+    if compact in PMD_RULESET_TO_CATEGORY:
+        return PMD_RULESET_TO_CATEGORY[compact]
+
+    return compact if compact else "unknown"
 
 
-def block_index_from_filename(filename: str) -> Optional[int]:
-    match = re.match(r"block_(\d+)\.java$", filename)
+def normalize_pmd_priority(priority: Any) -> Optional[int]:
+    try:
+        priority_int = int(priority)
+    except Exception:
+        return None
+
+    if priority_int not in PMD_PRIORITY_TO_LABEL:
+        return priority_int
+
+    return priority_int
+
+
+def pmd_priority_to_label(priority: Any) -> Optional[str]:
+    priority_int = normalize_pmd_priority(priority)
+
+    if priority_int is None:
+        return None
+
+    return PMD_PRIORITY_TO_LABEL.get(priority_int)
+
+
+def resolve_ruleset_xml_path() -> Optional[Path]:
+    if PMD_RULESET_CATEGORY_XML_PATH is not None:
+        if PMD_RULESET_CATEGORY_XML_PATH.exists():
+            return PMD_RULESET_CATEGORY_XML_PATH
+
+        raise FileNotFoundError(
+            f"PMD_RULESET_CATEGORY_XML_PATH does not exist: "
+            f"{PMD_RULESET_CATEGORY_XML_PATH}"
+        )
+
+    ruleset_candidate = Path(PMD_RULESET)
+
+    if ruleset_candidate.is_absolute() and ruleset_candidate.exists():
+        return ruleset_candidate
+
+    project_ruleset_candidate = PROJECT_ROOT / PMD_RULESET
+
+    if project_ruleset_candidate.exists():
+        return project_ruleset_candidate
+
+    return None
+
+
+def parse_category_and_rule_from_ref(ref: str) -> Optional[Tuple[str, str]]:
+    """
+    Parses refs such as:
+    category/java/errorprone.xml/CloseResource
+    category/java/bestpractices.xml/UnusedLocalVariable
+    """
+    ref = safe_text(ref).strip()
+
+    match = re.search(
+        r"category/java/([^/.\s]+)\.xml/([^/#\s]+)",
+        ref,
+    )
 
     if not match:
         return None
 
-    return int(match.group(1))
+    category = normalize_pmd_category(match.group(1))
+    rule_id = match.group(2).strip()
 
+    if not category or not rule_id:
+        return None
+
+    return category, rule_id
+
+
+def load_rule_category_map_from_ruleset_xml() -> Dict[str, str]:
+    ruleset_xml_path = resolve_ruleset_xml_path()
+
+    if ruleset_xml_path is None:
+        return {}
+
+    try:
+        root = ET.parse(ruleset_xml_path).getroot()
+    except Exception as exc:
+        raise ValueError(
+            f"Could not parse PMD ruleset XML file: {ruleset_xml_path}. Error: {exc}"
+        ) from exc
+
+    rule_category_by_id: Dict[str, str] = {}
+
+    for rule_element in root.findall(".//{*}rule"):
+        ref = safe_text(rule_element.get("ref")).strip()
+
+        if not ref:
+            continue
+
+        parsed = parse_category_and_rule_from_ref(ref)
+
+        if parsed is None:
+            continue
+
+        category, rule_id = parsed
+        rule_category_by_id[rule_id] = category
+
+    return rule_category_by_id
+
+
+def infer_category_from_external_info_url(value: Any) -> Optional[str]:
+    url = safe_text(value).strip()
+
+    if not url:
+        return None
+
+    match = re.search(
+        r"pmd_rules_java_([a-zA-Z0-9_-]+)\.html",
+        url,
+    )
+
+    if not match:
+        return None
+
+    return normalize_pmd_category(match.group(1))
+
+
+def infer_pmd_category(
+    violation: Dict[str, Any],
+    rule_category_by_id: Dict[str, str],
+) -> str:
+    rule_id = safe_text(violation.get("rule")).strip()
+
+    if rule_id in rule_category_by_id:
+        return rule_category_by_id[rule_id]
+
+    explicit_category = (
+        violation.get("category")
+        or violation.get("categoryName")
+        or violation.get("ruleCategory")
+    )
+
+    if explicit_category:
+        return normalize_pmd_category(explicit_category)
+
+    ruleset = violation.get("ruleset") or violation.get("ruleSet")
+
+    if ruleset:
+        return normalize_pmd_category(ruleset)
+
+    external_url_category = infer_category_from_external_info_url(
+        violation.get("externalInfoUrl")
+        or violation.get("externalInfoURL")
+        or violation.get("externalInfoUri")
+    )
+
+    if external_url_category:
+        return external_url_category
+
+    return "unknown"
+
+
+# ============================================================
+# PMD output parsing
+# ============================================================
 
 def extract_json_object(text: str) -> str:
     text = safe_text(text).strip()
@@ -389,20 +635,52 @@ def extract_json_object(text: str) -> str:
     return text[start:end + 1]
 
 
-def get_block_index_from_pmd_filename(filename_value: Any) -> Optional[int]:
-    filename = filename_from_path(filename_value)
-    return block_index_from_filename(filename)
+def filename_from_path(path_value: Any) -> str:
+    path_text = safe_text(path_value).replace("\\", "/")
+    return path_text.rsplit("/", 1)[-1]
 
 
-def parse_pmd_output(stdout: str) -> Dict[int, List[Dict[str, Any]]]:
-    issues_by_block: Dict[int, List[Dict[str, Any]]] = {}
+def normalize_column(
+    column: Any,
+    column_offset: int,
+) -> Optional[int]:
+    if not isinstance(column, int):
+        return None
+
+    if column_offset <= 0:
+        return column
+
+    return max(1, column - column_offset)
+
+
+def sort_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        issues,
+        key=lambda issue: (
+            issue.get("line") if isinstance(issue.get("line"), int) else 10**9,
+            issue.get("column") if isinstance(issue.get("column"), int) else 10**9,
+            safe_text(issue.get("rule_id")),
+        ),
+    )
+
+
+def parse_pmd_output_for_file(
+    stdout: str,
+    target_file: Path,
+    line_map: Dict[int, int],
+    column_offset_by_line: Dict[int, int],
+    rule_category_by_id: Dict[str, str],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    issues: List[Dict[str, Any]] = []
+    processing_errors: List[str] = []
 
     json_text = extract_json_object(stdout)
 
     if not json_text:
-        return issues_by_block
+        return issues, processing_errors
 
     data = json.loads(json_text)
+    target_filename = target_file.name
 
     for file_item in data.get("files", []) or []:
         filename_value = (
@@ -411,23 +689,48 @@ def parse_pmd_output(stdout: str) -> Dict[int, List[Dict[str, Any]]]:
             or file_item.get("path")
         )
 
-        block_index = get_block_index_from_pmd_filename(filename_value)
+        filename = filename_from_path(filename_value)
 
-        if block_index is None:
+        if filename != target_filename:
             continue
 
-        violations = file_item.get("violations") or []
+        for violation in file_item.get("violations") or []:
+            rule_id = safe_text(violation.get("rule")).strip()
 
-        for violation in violations:
+            if rule_id in IGNORED_PMD_RULE_IDS:
+                continue
+
+            generated_line = violation.get("beginline")
+
+            if not isinstance(generated_line, int):
+                continue
+
+            original_line = line_map.get(generated_line)
+
+            # Drop PMD findings on artificial wrapper lines.
+            if original_line is None:
+                continue
+
+            column_offset = column_offset_by_line.get(generated_line, 0)
+            priority = normalize_pmd_priority(violation.get("priority"))
+
             issue = {
-                "rule_id": violation.get("rule"),
+                "rule_id": rule_id,
+                "category": infer_pmd_category(
+                    violation=violation,
+                    rule_category_by_id=rule_category_by_id,
+                ),
+                "priority": priority,
+                "priority_label": pmd_priority_to_label(priority),
                 "message": violation.get("description"),
-                "severity": violation.get("priority"),
-                "line": violation.get("beginline"),
-                "column": violation.get("begincolumn"),
+                "line": original_line,
+                "column": normalize_column(
+                    column=violation.get("begincolumn"),
+                    column_offset=column_offset,
+                ),
             }
 
-            issues_by_block.setdefault(block_index, []).append(issue)
+            issues.append(issue)
 
     for error in data.get("processingErrors", []) or []:
         filename_value = (
@@ -436,48 +739,281 @@ def parse_pmd_output(stdout: str) -> Dict[int, List[Dict[str, Any]]]:
             or error.get("path")
         )
 
-        block_index = get_block_index_from_pmd_filename(filename_value)
+        filename = filename_from_path(filename_value)
 
-        if block_index is None:
+        if filename and filename != target_filename:
             continue
 
-        message = error.get("message") or error.get("detail") or "PMD processing error"
+        message = (
+            error.get("message")
+            or error.get("detail")
+            or "PMD processing error"
+        )
 
-        issue = {
-            "rule_id": None,
-            "message": message,
-            "severity": None,
-            "line": None,
-            "column": None,
-        }
+        processing_errors.append(safe_text(message))
 
-        issues_by_block.setdefault(block_index, []).append(issue)
-
-    return issues_by_block
+    return sort_issues(issues), processing_errors
 
 
 # ============================================================
-# Dataset
+# Java wrapping
+# ============================================================
+
+def is_java_preamble_line(line: str) -> bool:
+    stripped = line.strip()
+
+    return (
+        not stripped
+        or stripped.startswith("//")
+        or stripped.startswith("/*")
+        or stripped.startswith("*")
+        or stripped.startswith("*/")
+        or stripped.startswith("package ")
+        or stripped.startswith("import ")
+    )
+
+
+def split_java_preamble(
+    code: str,
+) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]]]:
+    """
+    Splits initial package/import/comment lines from the rest of the snippet.
+
+    This allows wrappers such as:
+    import x.y.Z;
+
+    public class GeneratedSnippet {
+        original body here
+    }
+    """
+    leading: List[Tuple[int, str]] = []
+    body: List[Tuple[int, str]] = []
+
+    seen_body = False
+
+    for original_line_number, line in enumerate(safe_text(code).splitlines(), start=1):
+        if not seen_body and is_java_preamble_line(line):
+            leading.append((original_line_number, line))
+            continue
+
+        seen_body = True
+        body.append((original_line_number, line))
+
+    return leading, body
+
+
+def build_raw_candidate(code: str) -> Dict[str, Any]:
+    lines = safe_text(code).splitlines()
+
+    line_map = {
+        generated_line_number: generated_line_number
+        for generated_line_number in range(1, len(lines) + 1)
+    }
+
+    return {
+        "name": "raw",
+        "code": safe_text(code).strip("\n\r") + "\n",
+        "line_map": line_map,
+        "column_offset_by_line": {},
+    }
+
+
+def build_class_wrapper_candidate(code: str) -> Dict[str, Any]:
+    leading, body = split_java_preamble(code)
+
+    output_lines: List[str] = []
+    line_map: Dict[int, int] = {}
+    column_offset_by_line: Dict[int, int] = {}
+
+    for original_line_number, line in leading:
+        output_lines.append(line)
+        generated_line_number = len(output_lines)
+        line_map[generated_line_number] = original_line_number
+
+    output_lines.append("public class GeneratedSnippet {")
+
+    for original_line_number, line in body:
+        output_lines.append(line)
+        generated_line_number = len(output_lines)
+        line_map[generated_line_number] = original_line_number
+        column_offset_by_line[generated_line_number] = 0
+
+    output_lines.append("}")
+
+    return {
+        "name": "class_wrapper",
+        "code": "\n".join(output_lines) + "\n",
+        "line_map": line_map,
+        "column_offset_by_line": column_offset_by_line,
+    }
+
+
+def build_method_wrapper_candidate(code: str) -> Dict[str, Any]:
+    leading, body = split_java_preamble(code)
+
+    output_lines: List[str] = []
+    line_map: Dict[int, int] = {}
+    column_offset_by_line: Dict[int, int] = {}
+
+    for original_line_number, line in leading:
+        output_lines.append(line)
+        generated_line_number = len(output_lines)
+        line_map[generated_line_number] = original_line_number
+
+    output_lines.append("public class GeneratedSnippet {")
+    output_lines.append("    public void generatedMethod() {")
+
+    for original_line_number, line in body:
+        output_lines.append("        " + line)
+        generated_line_number = len(output_lines)
+        line_map[generated_line_number] = original_line_number
+        column_offset_by_line[generated_line_number] = 8
+
+    output_lines.append("    }")
+    output_lines.append("}")
+
+    return {
+        "name": "method_wrapper",
+        "code": "\n".join(output_lines) + "\n",
+        "line_map": line_map,
+        "column_offset_by_line": column_offset_by_line,
+    }
+
+
+def build_pmd_candidates(code: str) -> List[Dict[str, Any]]:
+    return [
+        build_raw_candidate(code),
+        build_class_wrapper_candidate(code),
+        build_method_wrapper_candidate(code),
+    ]
+
+
+# ============================================================
+# Snippet saving
+# ============================================================
+
+def make_snippet_id(conversation_id: str, block_index: int) -> str:
+    return f"{conversation_id}__block_{block_index:03d}"
+
+
+def save_java_candidate(
+    root_dir: Path,
+    conversation_id: str,
+    block_index: int,
+    candidate_name: str,
+    code: str,
+) -> Path:
+    candidate_dir = (
+        root_dir
+        / safe_filename(conversation_id)
+        / safe_filename(candidate_name)
+    )
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+
+    path = candidate_dir / f"block_{block_index:03d}.java"
+    path.write_text(code, encoding="utf-8")
+
+    return path
+
+
+def save_debug_raw_blocks(
+    conversation_id: str,
+    java_blocks: List[Dict[str, Any]],
+) -> None:
+    conversation_dir = EXTRACTED_SNIPPETS_DIR / safe_filename(conversation_id)
+    conversation_dir.mkdir(parents=True, exist_ok=True)
+
+    for block in java_blocks:
+        block_index = int(block["block_index"])
+        path = conversation_dir / f"block_{block_index:03d}.java"
+        path.write_text(safe_text(block["code"]), encoding="utf-8")
+
+
+# ============================================================
+# Single block analysis
+# ============================================================
+
+def analyze_java_block(
+    conversation_id: str,
+    block_index: int,
+    code: str,
+    conversation_work_dir: Path,
+    rule_category_by_id: Dict[str, str],
+) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
+    """
+    Tries PMD analysis in this order:
+    1. raw Java block;
+    2. same block wrapped as class members;
+    3. same block wrapped inside a generated method.
+
+    PMD processing errors are not emitted as issues.
+    If all candidates fail with processing errors, the block is marked as parse_error.
+    """
+    last_processing_errors: List[str] = []
+
+    for candidate in build_pmd_candidates(code):
+        candidate_path = save_java_candidate(
+            root_dir=conversation_work_dir,
+            conversation_id=conversation_id,
+            block_index=block_index,
+            candidate_name=candidate["name"],
+            code=candidate["code"],
+        )
+
+        stdout, stderr = run_pmd([candidate_path])
+
+        stdout_text = safe_text(stdout).strip()
+        stderr_text = safe_text(stderr).strip()
+
+        if not stdout_text and stderr_text:
+            return "tool_error", [], stderr_text
+
+        issues, processing_errors = parse_pmd_output_for_file(
+            stdout=stdout_text,
+            target_file=candidate_path,
+            line_map=candidate["line_map"],
+            column_offset_by_line=candidate["column_offset_by_line"],
+            rule_category_by_id=rule_category_by_id,
+        )
+
+        if processing_errors:
+            last_processing_errors = processing_errors
+            continue
+
+        return "ok", issues, None
+
+    error_message = "PMD parse error after raw and wrapped analysis."
+
+    if last_processing_errors:
+        error_message += " Last error: " + " | ".join(last_processing_errors[:3])
+
+    return "parse_error", [], error_message
+
+
+# ============================================================
+# Dataset loading
 # ============================================================
 
 def load_parquet_files() -> List[Path]:
-    parquet_files = sorted(INPUT_DIR.glob("*.parquet"))
+    parquet_files = sorted(FINAL_DATASET_DIR.glob("*.parquet"))
 
     if MAX_FILES is not None:
         parquet_files = parquet_files[:MAX_FILES]
 
     if not parquet_files:
-        raise FileNotFoundError(f"No parquet files found in: {INPUT_DIR}")
+        raise FileNotFoundError(f"No parquet files found in: {FINAL_DATASET_DIR}")
 
     return parquet_files
 
 
-def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def filter_dataframe(
+    df: pd.DataFrame,
+    target_conversation_ids: Set[str],
+    completed_conversation_ids: Set[str],
+) -> pd.DataFrame:
     required_columns = {
         "conversation_id",
         "conversation",
-        "detected_language",
-        "task_category",
     }
 
     missing = required_columns - set(df.columns)
@@ -486,15 +1022,11 @@ def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
     df = df.copy()
-
     df["conversation_id"] = df["conversation_id"].astype(str)
-    df["detected_language"] = df["detected_language"].astype(str).str.upper()
-    df["task_category"] = df["task_category"].astype(str).str.upper()
 
-    mask = (
-        df["detected_language"].isin(TARGET_NATURAL_LANGUAGES)
-        & df["task_category"].isin(TARGET_TASKS)
-    )
+    remaining_ids = target_conversation_ids - completed_conversation_ids
+
+    mask = df["conversation_id"].isin(remaining_ids)
 
     if TARGET_CONVERSATION_ID is not None:
         mask = mask & (df["conversation_id"] == str(TARGET_CONVERSATION_ID))
@@ -503,22 +1035,18 @@ def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# Analysis
+# Output records
 # ============================================================
-
-def make_snippet_id(conversation_id: str, block_index: int) -> str:
-    return f"{conversation_id}__block_{block_index:03d}"
-
 
 def build_output_record(
     conversation_id: str,
     block_index: int,
     code: str,
+    status: str,
     issues: List[Dict[str, Any]],
-    status: str = "ok",
     error: Optional[str] = None,
 ) -> Dict[str, Any]:
-    record = {
+    record: Dict[str, Any] = {
         "snippet_id": make_snippet_id(conversation_id, block_index),
         "conversation_id": conversation_id,
         "block_index": block_index,
@@ -534,127 +1062,80 @@ def build_output_record(
     return record
 
 
+# ============================================================
+# Conversation analysis
+# ============================================================
+
 def analyze_conversation(
     row: pd.Series,
     working_root_dir: Path,
+    rule_category_by_id: Dict[str, str],
     max_java_snippets: Optional[int] = None,
 ) -> int:
-    conversation_id = str(row["conversation_id"])
-    blocks = extract_code_blocks(row["conversation"])
+    conversation_id = safe_text(row["conversation_id"]).strip()
+    java_blocks = extract_java_blocks(row["conversation"])
 
-    java_blocks: Dict[int, Dict[str, Any]] = {}
-    java_files: List[Path] = []
-
-    for block in blocks:
-        block_index = int(block["block_index"])
-        language = block["programming_language"]
-        code = block["code"]
-
-        if SAVE_EXTRACTED_SNIPPETS:
-            saved_path = save_block(
-                root_dir=EXTRACTED_SNIPPETS_DIR,
-                conversation_id=conversation_id,
-                block_index=block_index,
-                programming_language=language,
-                code=code,
-            )
-        else:
-            saved_path = None
-
-        if language != "JAVA":
-            continue
-
-        if max_java_snippets is not None and len(java_files) >= max_java_snippets:
-            continue
-
-        if saved_path is not None:
-            snippet_path = saved_path
-        else:
-            snippet_path = save_block(
-                root_dir=working_root_dir,
-                conversation_id=conversation_id,
-                block_index=block_index,
-                programming_language="JAVA",
-                code=code,
-            )
-
-        java_blocks[block_index] = {
-            "code": code,
-            "path": snippet_path,
-        }
-
-        java_files.append(snippet_path)
-
-    if not java_files:
+    if not java_blocks:
         return 0
 
-    try:
-        stdout, stderr = run_pmd(java_files)
+    if max_java_snippets is not None:
+        java_blocks = java_blocks[:max_java_snippets]
 
-        stdout_text = safe_text(stdout).strip()
-        stderr_text = safe_text(stderr).strip()
+    if not java_blocks:
+        return 0
 
-        if not stdout_text and stderr_text:
-            for block_index, block_data in java_blocks.items():
-                record = build_output_record(
-                    conversation_id=conversation_id,
-                    block_index=block_index,
-                    code=block_data["code"],
-                    issues=[],
-                    status="tool_error",
-                    error=stderr_text,
-                )
+    conversation_work_dir = working_root_dir / safe_filename(conversation_id)
+    conversation_work_dir.mkdir(parents=True, exist_ok=True)
 
-                write_jsonl(PMD_OUTPUT_JSONL, record)
+    if SAVE_EXTRACTED_SNIPPETS:
+        save_debug_raw_blocks(
+            conversation_id=conversation_id,
+            java_blocks=java_blocks,
+        )
 
-            return len(java_blocks)
+    written = 0
 
-        issues_by_block = parse_pmd_output(stdout_text)
+    for block in java_blocks:
+        block_index = int(block["block_index"])
+        code = safe_text(block["code"])
 
-        for block_index, block_data in java_blocks.items():
-            issues = issues_by_block.get(block_index, [])
-
-            record = build_output_record(
+        try:
+            status, issues, error = analyze_java_block(
                 conversation_id=conversation_id,
                 block_index=block_index,
-                code=block_data["code"],
-                issues=issues,
+                code=code,
+                conversation_work_dir=conversation_work_dir,
+                rule_category_by_id=rule_category_by_id,
             )
 
-            write_jsonl(PMD_OUTPUT_JSONL, record)
+        except subprocess.TimeoutExpired:
+            status = "timeout"
+            issues = []
+            error = f"PMD timed out after {PMD_TIMEOUT_SECONDS} seconds."
 
-        return len(java_blocks)
+        except Exception as exc:
+            status = "tool_error"
+            issues = []
+            error = str(exc)
 
-    except subprocess.TimeoutExpired:
-        for block_index, block_data in java_blocks.items():
-            record = build_output_record(
-                conversation_id=conversation_id,
-                block_index=block_index,
-                code=block_data["code"],
-                issues=[],
-                status="timeout",
-                error=f"PMD timed out after {PMD_TIMEOUT_SECONDS} seconds.",
-            )
+        record = build_output_record(
+            conversation_id=conversation_id,
+            block_index=block_index,
+            code=code,
+            status=status,
+            issues=issues if status == "ok" else [],
+            error=error,
+        )
 
-            write_jsonl(PMD_OUTPUT_JSONL, record)
+        write_jsonl(PMD_OUTPUT_JSONL, record)
+        written += 1
 
-        return len(java_blocks)
+    return written
 
-    except Exception as exc:
-        for block_index, block_data in java_blocks.items():
-            record = build_output_record(
-                conversation_id=conversation_id,
-                block_index=block_index,
-                code=block_data["code"],
-                issues=[],
-                status="tool_error",
-                error=str(exc),
-            )
 
-            write_jsonl(PMD_OUTPUT_JSONL, record)
-
-        return len(java_blocks)
-
+# ============================================================
+# Cleaning
+# ============================================================
 
 def clean_outputs() -> None:
     if not OVERWRITE_OUTPUTS:
@@ -663,84 +1144,146 @@ def clean_outputs() -> None:
     if PMD_OUTPUT_JSONL.exists():
         PMD_OUTPUT_JSONL.unlink()
 
+    if PMD_PROGRESS_JSONL.exists():
+        PMD_PROGRESS_JSONL.unlink()
+
     if SAVE_EXTRACTED_SNIPPETS and EXTRACTED_SNIPPETS_DIR.exists():
         shutil.rmtree(EXTRACTED_SNIPPETS_DIR)
+
+
+# ============================================================
+# Main processing
+# ============================================================
+
+def process_dataset(
+    target_conversation_ids: Set[str],
+    completed_conversation_ids: Set[str],
+    working_root_dir: Path,
+    rule_category_by_id: Dict[str, str],
+) -> Dict[str, int]:
+    counters = {
+        "processed_conversations": 0,
+        "skipped_completed_conversations": len(completed_conversation_ids),
+        "conversations_with_java": 0,
+        "analyzed_java_snippets": 0,
+    }
+
+    for parquet_path in tqdm(load_parquet_files(), desc="Parquet files"):
+        df = pd.read_parquet(parquet_path)
+
+        df = filter_dataframe(
+            df=df,
+            target_conversation_ids=target_conversation_ids,
+            completed_conversation_ids=completed_conversation_ids,
+        )
+
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Conversations", leave=False):
+            if (
+                MAX_CONVERSATIONS is not None
+                and counters["processed_conversations"] >= MAX_CONVERSATIONS
+            ):
+                return counters
+
+            if (
+                MAX_SNIPPETS is not None
+                and counters["analyzed_java_snippets"] >= MAX_SNIPPETS
+            ):
+                return counters
+
+            conversation_id = safe_text(row["conversation_id"]).strip()
+
+            if conversation_id in completed_conversation_ids:
+                continue
+
+            remaining_snippets = None
+
+            if MAX_SNIPPETS is not None:
+                remaining_snippets = (
+                    MAX_SNIPPETS - counters["analyzed_java_snippets"]
+                )
+
+            analyzed_count = analyze_conversation(
+                row=row,
+                working_root_dir=working_root_dir,
+                rule_category_by_id=rule_category_by_id,
+                max_java_snippets=remaining_snippets,
+            )
+
+            write_progress(
+                conversation_id=conversation_id,
+                java_snippet_count=analyzed_count,
+            )
+
+            completed_conversation_ids.add(conversation_id)
+
+            counters["processed_conversations"] += 1
+            counters["analyzed_java_snippets"] += analyzed_count
+
+            if analyzed_count > 0:
+                counters["conversations_with_java"] += 1
+
+    return counters
+
+
+def print_summary(
+    counters: Dict[str, int],
+    rule_category_by_id: Dict[str, str],
+) -> None:
+    print()
+    print(f"Target tasks: {sorted(TARGET_TASKS)}")
+    print(f"Processed conversations in this run: {counters['processed_conversations']}")
+    print(f"Already completed conversations skipped: {counters['skipped_completed_conversations']}")
+    print(f"Conversations with Java snippets in this run: {counters['conversations_with_java']}")
+    print(f"Analyzed Java snippets in this run: {counters['analyzed_java_snippets']}")
+    print(f"Rule categories loaded from XML: {len(rule_category_by_id)}")
+    print(f"Results saved to: {PMD_OUTPUT_JSONL}")
+    print(f"Progress saved to: {PMD_PROGRESS_JSONL}")
+
+    if SAVE_EXTRACTED_SNIPPETS:
+        print(f"Extracted snippets saved to: {EXTRACTED_SNIPPETS_DIR}")
 
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     clean_outputs()
 
-    parquet_files = load_parquet_files()
+    rule_category_by_id = load_rule_category_map_from_ruleset_xml()
 
-    analyzed_snippets = 0
-    processed_conversations = 0
+    task_by_conversation_id = load_target_task_records()
+    target_conversation_ids = set(task_by_conversation_id.keys())
+
+    if not target_conversation_ids:
+        raise ValueError(
+            f"No conversations found for TARGET_TASKS={sorted(TARGET_TASKS)}"
+        )
+
+    completed_conversation_ids = load_completed_conversation_ids()
 
     if SAVE_EXTRACTED_SNIPPETS:
-        working_root_dir = EXTRACTED_SNIPPETS_DIR
+        EXTRACTED_SNIPPETS_DIR.mkdir(parents=True, exist_ok=True)
+        working_root_dir = EXTRACTED_SNIPPETS_DIR / "_tmp_pmd_work"
         working_root_dir.mkdir(parents=True, exist_ok=True)
 
-        for parquet_path in tqdm(parquet_files, desc="Parquet files"):
-            df = pd.read_parquet(parquet_path)
-            df = filter_dataframe(df)
-
-            for _, row in tqdm(df.iterrows(), total=len(df), desc="Conversations", leave=False):
-                if MAX_CONVERSATIONS is not None and processed_conversations >= MAX_CONVERSATIONS:
-                    print(f"Analyzed Java snippets: {analyzed_snippets}")
-                    return
-
-                if MAX_SNIPPETS is not None and analyzed_snippets >= MAX_SNIPPETS:
-                    print(f"Analyzed Java snippets: {analyzed_snippets}")
-                    return
-
-                remaining = None
-                if MAX_SNIPPETS is not None:
-                    remaining = MAX_SNIPPETS - analyzed_snippets
-
-                analyzed_count = analyze_conversation(
-                    row=row,
-                    working_root_dir=working_root_dir,
-                    max_java_snippets=remaining,
-                )
-
-                analyzed_snippets += analyzed_count
-                processed_conversations += 1
+        counters = process_dataset(
+            target_conversation_ids=target_conversation_ids,
+            completed_conversation_ids=completed_conversation_ids,
+            working_root_dir=working_root_dir,
+            rule_category_by_id=rule_category_by_id,
+        )
 
     else:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            working_root_dir = Path(tmp_dir)
+            counters = process_dataset(
+                target_conversation_ids=target_conversation_ids,
+                completed_conversation_ids=completed_conversation_ids,
+                working_root_dir=Path(tmp_dir),
+                rule_category_by_id=rule_category_by_id,
+            )
 
-            for parquet_path in tqdm(parquet_files, desc="Parquet files"):
-                df = pd.read_parquet(parquet_path)
-                df = filter_dataframe(df)
-
-                for _, row in tqdm(df.iterrows(), total=len(df), desc="Conversations", leave=False):
-                    if MAX_CONVERSATIONS is not None and processed_conversations >= MAX_CONVERSATIONS:
-                        print(f"Analyzed Java snippets: {analyzed_snippets}")
-                        return
-
-                    if MAX_SNIPPETS is not None and analyzed_snippets >= MAX_SNIPPETS:
-                        print(f"Analyzed Java snippets: {analyzed_snippets}")
-                        return
-
-                    remaining = None
-                    if MAX_SNIPPETS is not None:
-                        remaining = MAX_SNIPPETS - analyzed_snippets
-
-                    analyzed_count = analyze_conversation(
-                        row=row,
-                        working_root_dir=working_root_dir,
-                        max_java_snippets=remaining,
-                    )
-
-                    analyzed_snippets += analyzed_count
-                    processed_conversations += 1
-
-    print(f"Analyzed Java snippets: {analyzed_snippets}")
-    print(f"Results saved to: {PMD_OUTPUT_JSONL}")
-
-    if SAVE_EXTRACTED_SNIPPETS:
-        print(f"Extracted snippets saved to: {EXTRACTED_SNIPPETS_DIR}")
+    print_summary(
+        counters=counters,
+        rule_category_by_id=rule_category_by_id,
+    )
 
 
 if __name__ == "__main__":

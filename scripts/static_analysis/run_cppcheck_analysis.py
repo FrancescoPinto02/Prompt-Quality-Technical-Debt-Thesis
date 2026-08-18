@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 from tqdm import tqdm
@@ -15,28 +15,30 @@ from tqdm import tqdm
 # Configuration
 # ============================================================
 
-INPUT_DIR = Path("data/final/v1")
-OUTPUT_DIR = Path("data/static_analysis/v1")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+FINAL_DATASET_DIR = PROJECT_ROOT / "data/final/v1"
+
+TASK_CLASSIFICATION_JSONL = (
+    PROJECT_ROOT
+    / "data/intent_classification/task_classification.jsonl"
+)
+
+OUTPUT_DIR = PROJECT_ROOT / "data/static_analysis/v1"
 
 CPPCHECK_OUTPUT_JSONL = OUTPUT_DIR / "cppcheck_cpp.jsonl"
+CPPCHECK_PROGRESS_JSONL = OUTPUT_DIR / "cppcheck_cpp_progress.jsonl"
 
-# If True, all extracted code blocks are saved permanently for debugging.
-SAVE_EXTRACTED_SNIPPETS = True
-EXTRACTED_SNIPPETS_DIR = OUTPUT_DIR / "extracted_snippets_cpp"
+SAVE_EXTRACTED_SNIPPETS = False
+EXTRACTED_SNIPPETS_DIR = OUTPUT_DIR / "extracted_cpp_snippets"
 
-TARGET_NATURAL_LANGUAGES = {"EN"}
-
-TARGET_TASKS = {
+TARGET_TASKS: Set[str] = {
     "CODE_GENERATION",
     "CODE_MODIFICATION",
-    "REFACTORING",
-    "BUG_FIXING",
+    "ISSUE_RESOLVING",
 }
 
-# For testing one conversation only.
-# Set to None to process all conversations.
-TARGET_CONVERSATION_ID: Optional[str] = "f2a78ee13b6d412777d7bd4016e5aa38"
-# TARGET_CONVERSATION_ID = "ce225613c3240db229bcc8f37f8fc85c"
+TARGET_CONVERSATION_ID: Optional[str] = None
 
 MAX_FILES: Optional[int] = None
 MAX_CONVERSATIONS: Optional[int] = None
@@ -47,13 +49,33 @@ OVERWRITE_OUTPUTS = True
 CPPCHECK_COMMAND = "cppcheck"
 CPPCHECK_TIMEOUT_SECONDS = 60
 
+# More suitable for isolated LLM snippets than --enable=all.
+# In particular, we avoid whole-program checks such as unusedFunction.
 CPPCHECK_EXTRA_ARGS = [
     "--enable=all",
-    "--inconclusive",
     "--std=c++17",
     "--language=c++",
     "--check-level=exhaustive",
 ]
+
+IGNORED_CPPCHECK_RULE_IDS = {
+    # Environment-dependent include resolution.
+    "missingInclude",
+    "missingIncludeSystem",
+
+    # Informational/tool messages, not code-quality findings.
+    "checkersReport",
+    "normalCheckLevelMaxBranches",
+
+    # Very noisy for LLM snippets: generated functions are often intentionally not called.
+    "unusedFunction",
+}
+
+PARSE_RELATED_CPPCHECK_RULE_IDS = {
+    "syntaxError",
+    "unknownMacro",
+    "internalAstError",
+}
 
 CPP_LANGUAGE_TAGS = {
     "cpp",
@@ -64,6 +86,14 @@ CPP_LANGUAGE_TAGS = {
     "hh",
     "hxx",
     "h++",
+    "cpp11",
+    "cpp14",
+    "cpp17",
+    "cpp20",
+    "c++11",
+    "c++14",
+    "c++17",
+    "c++20",
 }
 
 
@@ -78,7 +108,7 @@ def safe_text(value: Any) -> str:
 
 
 def safe_filename(value: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_.-]", "_", str(value))
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", safe_text(value))
 
 
 def write_jsonl(path: Path, record: Dict[str, Any]) -> None:
@@ -89,7 +119,16 @@ def write_jsonl(path: Path, record: Dict[str, Any]) -> None:
 
 
 def count_non_blank_lines(text: str) -> int:
-    return sum(1 for line in text.splitlines() if line.strip())
+    return sum(1 for line in safe_text(text).splitlines() if line.strip())
+
+
+def int_or_none(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except Exception:
+        return None
 
 
 def to_python(value: Any) -> Any:
@@ -129,13 +168,105 @@ def maybe_parse_json_string(value: Any) -> Any:
         return value
 
 
-def int_or_none(value: Any) -> Optional[int]:
-    try:
-        if value is None or value == "":
-            return None
-        return int(value)
-    except Exception:
-        return None
+# ============================================================
+# Resume utilities
+# ============================================================
+
+def load_completed_conversation_ids() -> Set[str]:
+    completed: Set[str] = set()
+
+    if OVERWRITE_OUTPUTS:
+        return completed
+
+    if CPPCHECK_PROGRESS_JSONL.exists():
+        with CPPCHECK_PROGRESS_JSONL.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+
+                conversation_id = safe_text(obj.get("conversation_id")).strip()
+                status = safe_text(obj.get("status")).strip()
+
+                if conversation_id and status == "done":
+                    completed.add(conversation_id)
+
+    if CPPCHECK_OUTPUT_JSONL.exists():
+        with CPPCHECK_OUTPUT_JSONL.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+
+                conversation_id = safe_text(obj.get("conversation_id")).strip()
+
+                if conversation_id:
+                    completed.add(conversation_id)
+
+    return completed
+
+
+def write_progress(
+    conversation_id: str,
+    cpp_snippet_count: int,
+) -> None:
+    write_jsonl(
+        CPPCHECK_PROGRESS_JSONL,
+        {
+            "conversation_id": conversation_id,
+            "status": "done",
+            "cpp_snippet_count": cpp_snippet_count,
+        },
+    )
+
+
+# ============================================================
+# Task classification loading
+# ============================================================
+
+def load_target_task_records() -> Dict[str, str]:
+    if not TASK_CLASSIFICATION_JSONL.exists():
+        raise FileNotFoundError(
+            f"Task classification JSONL not found: {TASK_CLASSIFICATION_JSONL}"
+        )
+
+    conversation_id_to_task: Dict[str, str] = {}
+
+    with TASK_CLASSIFICATION_JSONL.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line:
+                continue
+
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+
+            conversation_id = safe_text(obj.get("conversation_id")).strip()
+            task = safe_text(obj.get("task")).strip().upper()
+            status = safe_text(obj.get("status")).strip()
+
+            if status and status != "ok":
+                continue
+
+            if conversation_id and task in TARGET_TASKS:
+                conversation_id_to_task[conversation_id] = task
+
+    return conversation_id_to_task
 
 
 # ============================================================
@@ -163,7 +294,7 @@ def iter_assistant_messages(conversation: Any) -> Iterable[Dict[str, Any]]:
     for message in iter_messages(conversation):
         role = safe_text(message.get("role")).strip().lower()
 
-        if role in {"assistant", "llm", "model"}:
+        if role in {"assistant", "llm", "model", "chatgpt"}:
             yield message
 
 
@@ -171,72 +302,38 @@ def iter_assistant_messages(conversation: Any) -> Iterable[Dict[str, Any]]:
 # Code block extraction
 # ============================================================
 
-CODE_BLOCK_PATTERN = re.compile(
-    r"```([^\n`]*)\n(.*?)```",
+CODE_FENCE_RE = re.compile(
+    r"```[ \t]*([^\n\r`]*)[\r\n](.*?)```",
     flags=re.DOTALL,
 )
 
 
-def normalize_language_tag(raw_tag: str) -> str:
+def normalize_language_tag(raw_tag: Any) -> str:
     tag = safe_text(raw_tag).strip().lower()
 
     if not tag:
         return "UNKNOWN"
 
-    first_token = tag.split()[0].strip()
-    first_token = first_token.strip("{}[]()\"'`.,:;")
+    tag = tag.strip("{}[]()")
+    first_token = re.split(r"\s+", tag)[0].strip().strip("{}[]()\"'`.,:;")
+
+    if first_token.startswith("."):
+        first_token = first_token.replace(".", "", 1)
 
     if first_token in CPP_LANGUAGE_TAGS:
         return "CPP"
 
-    if first_token in {"python", "py", "python3"}:
-        return "PYTHON"
-
-    if first_token in {"js", "javascript", "node", "nodejs"}:
-        return "JAVASCRIPT"
-
-    if first_token == "java":
-        return "JAVA"
-
-    if first_token in {"cs", "csharp", "c#"}:
-        return "CSHARP"
-
-    return first_token.upper()
-
-
-def extension_for_language(language: str) -> str:
-    mapping = {
-        "CPP": ".cpp",
-        "PYTHON": ".py",
-        "JAVASCRIPT": ".js",
-        "JAVA": ".java",
-        "CSHARP": ".cs",
-    }
-
-    return mapping.get(language, ".txt")
-
-
-def folder_for_language(language: str) -> str:
-    mapping = {
-        "CPP": "cpp",
-        "PYTHON": "python",
-        "JAVASCRIPT": "javascript",
-        "JAVA": "java",
-        "CSHARP": "csharp",
-        "UNKNOWN": "unknown",
-    }
-
-    return mapping.get(language, safe_filename(language.lower()))
+    return first_token.upper() if first_token else "UNKNOWN"
 
 
 def extract_code_blocks(conversation: Any) -> List[Dict[str, Any]]:
-    blocks = []
+    blocks: List[Dict[str, Any]] = []
     block_index = 0
 
     for message in iter_assistant_messages(conversation):
         content = safe_text(message.get("content"))
 
-        for match in CODE_BLOCK_PATTERN.finditer(content):
+        for match in CODE_FENCE_RE.finditer(content):
             raw_language_tag = match.group(1)
             code = match.group(2)
             language = normalize_language_tag(raw_language_tag)
@@ -245,7 +342,7 @@ def extract_code_blocks(conversation: Any) -> List[Dict[str, Any]]:
                 {
                     "block_index": block_index,
                     "programming_language": language,
-                    "code": code,
+                    "code": code.strip("\n\r"),
                 }
             )
 
@@ -254,164 +351,435 @@ def extract_code_blocks(conversation: Any) -> List[Dict[str, Any]]:
     return blocks
 
 
-# ============================================================
-# Snippet saving
-# ============================================================
-
-def get_conversation_dir(root_dir: Path, conversation_id: str) -> Path:
-    return root_dir / safe_filename(conversation_id)
-
-
-def get_block_path(
-    conversation_dir: Path,
-    block_index: int,
-    programming_language: str,
-) -> Path:
-    language_dir = conversation_dir / folder_for_language(programming_language)
-    extension = extension_for_language(programming_language)
-
-    return language_dir / f"block_{block_index:03d}{extension}"
-
-
-def save_block(
-    conversation_dir: Path,
-    block_index: int,
-    programming_language: str,
-    code: str,
-) -> Path:
-    path = get_block_path(
-        conversation_dir=conversation_dir,
-        block_index=block_index,
-        programming_language=programming_language,
-    )
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(code, encoding="utf-8")
-
-    return path
-
-
-# ============================================================
-# Cppcheck
-# ============================================================
-
-def build_cppcheck_command(cpp_files: List[Path]) -> List[str]:
+def extract_cpp_blocks(conversation: Any) -> List[Dict[str, Any]]:
     return [
-        CPPCHECK_COMMAND,
-        "--xml",
-        "--xml-version=2",
-        *CPPCHECK_EXTRA_ARGS,
-        *[str(path) for path in cpp_files],
+        block
+        for block in extract_code_blocks(conversation)
+        if block["programming_language"] == "CPP"
+        and safe_text(block["code"]).strip()
     ]
 
 
-def run_cppcheck(cpp_files: List[Path]) -> Tuple[str, str]:
+# ============================================================
+# Cppcheck execution
+# ============================================================
+
+def get_cppcheck_executable() -> str:
+    candidate = Path(CPPCHECK_COMMAND)
+
+    if candidate.exists():
+        return str(candidate.resolve())
+
+    found = shutil.which(CPPCHECK_COMMAND)
+
+    if found:
+        return found
+
+    raise FileNotFoundError(
+        f"Cppcheck executable not found: {CPPCHECK_COMMAND}. "
+        "Add Cppcheck to PATH or set CPPCHECK_COMMAND explicitly."
+    )
+
+
+def build_cppcheck_command(cpp_file: Path) -> List[str]:
+    return [
+        get_cppcheck_executable(),
+        "--xml",
+        "--xml-version=2",
+        *CPPCHECK_EXTRA_ARGS,
+        str(cpp_file),
+    ]
+
+
+def run_cppcheck(cpp_file: Path) -> Tuple[str, str]:
     completed = subprocess.run(
-        build_cppcheck_command(cpp_files),
+        build_cppcheck_command(cpp_file),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=CPPCHECK_TIMEOUT_SECONDS,
     )
 
     return completed.stdout, completed.stderr
 
 
-def filename_from_path(path_value: Any) -> str:
-    path_text = safe_text(path_value)
-    path_text = path_text.replace("\\", "/")
-    return path_text.rsplit("/", 1)[-1]
-
-
-def block_index_from_filename(filename: str) -> Optional[int]:
-    match = re.match(r"block_(\d+)\.cpp$", filename)
-
-    if not match:
-        return None
-
-    return int(match.group(1))
-
+# ============================================================
+# Cppcheck XML parsing
+# ============================================================
 
 def extract_xml_from_cppcheck_stderr(stderr: str) -> str:
     stderr = safe_text(stderr).strip()
 
     xml_start = stderr.find("<?xml")
+
     if xml_start >= 0:
         return stderr[xml_start:].strip()
 
     results_start = stderr.find("<results")
+
     if results_start >= 0:
         return stderr[results_start:].strip()
 
     return ""
 
 
-def parse_cppcheck_output(stderr: str) -> Dict[int, List[Dict[str, Any]]]:
-    issues_by_block: Dict[int, List[Dict[str, Any]]] = {}
+def filename_from_path(path_value: Any) -> str:
+    path_text = safe_text(path_value).replace("\\", "/")
+    return path_text.rsplit("/", 1)[-1]
+
+
+def normalize_column(
+    column: Any,
+    column_offset: int,
+) -> Optional[int]:
+    column_int = int_or_none(column)
+
+    if column_int is None:
+        return None
+
+    if column_offset <= 0:
+        return column_int
+
+    return max(1, column_int - column_offset)
+
+
+def select_location_for_file(
+    error_node: ET.Element,
+    target_filename: str,
+) -> Optional[ET.Element]:
+    locations = error_node.findall("location")
+
+    for location in locations:
+        filename = filename_from_path(location.get("file"))
+
+        if filename == target_filename:
+            return location
+
+    if locations:
+        return locations[0]
+
+    return None
+
+
+def issue_from_cppcheck_error(
+    error_node: ET.Element,
+    line_map: Dict[int, int],
+    column_offset_by_line: Dict[int, int],
+    target_filename: str,
+) -> Optional[Dict[str, Any]]:
+    selected_location = select_location_for_file(
+        error_node=error_node,
+        target_filename=target_filename,
+    )
+
+    if selected_location is not None:
+        generated_line = int_or_none(selected_location.get("line"))
+        generated_column = selected_location.get("column")
+    else:
+        generated_line = int_or_none(error_node.get("line"))
+        generated_column = error_node.get("column")
+
+    original_line: Optional[int] = None
+    column_offset = 0
+
+    if generated_line is not None:
+        original_line = line_map.get(generated_line)
+        column_offset = column_offset_by_line.get(generated_line, 0)
+
+    # Drop findings on artificial wrapper lines.
+    if generated_line is not None and original_line is None:
+        return None
+
+    return {
+        "rule_id": error_node.get("id"),
+        "message": error_node.get("msg"),
+        "severity": error_node.get("severity"),
+        "line": original_line,
+        "column": normalize_column(
+            column=generated_column,
+            column_offset=column_offset,
+        ),
+    }
+
+
+def parse_cppcheck_output_for_file(
+    stderr: str,
+    target_file: Path,
+    line_map: Dict[int, int],
+    column_offset_by_line: Dict[int, int],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    issues: List[Dict[str, Any]] = []
+    parse_errors: List[str] = []
 
     xml_text = extract_xml_from_cppcheck_stderr(stderr)
 
     if not xml_text:
-        return issues_by_block
+        return issues, parse_errors
 
     root = ET.fromstring(xml_text)
     errors_node = root.find("errors")
 
     if errors_node is None:
-        return issues_by_block
+        return issues, parse_errors
+
+    target_filename = target_file.name
 
     for error_node in errors_node.findall("error"):
-        locations = error_node.findall("location")
+        rule_id = safe_text(error_node.get("id")).strip()
 
-        if locations:
-            location = locations[0]
-            filename = filename_from_path(location.get("file"))
-            line = int_or_none(location.get("line"))
-            column = int_or_none(location.get("column"))
-        else:
-            filename = filename_from_path(error_node.get("file"))
-            line = int_or_none(error_node.get("line"))
-            column = int_or_none(error_node.get("column"))
-
-        block_index = block_index_from_filename(filename)
-
-        if block_index is None:
+        if rule_id in IGNORED_CPPCHECK_RULE_IDS:
             continue
 
-        issue = {
-            "rule_id": error_node.get("id"),
-            "message": error_node.get("msg"),
-            "severity": error_node.get("severity"),
-            "line": line,
-            "column": column,
-        }
+        if rule_id in PARSE_RELATED_CPPCHECK_RULE_IDS:
+            message = safe_text(error_node.get("msg")).strip()
+            parse_errors.append(message or rule_id)
+            continue
 
-        issues_by_block.setdefault(block_index, []).append(issue)
+        issue = issue_from_cppcheck_error(
+            error_node=error_node,
+            line_map=line_map,
+            column_offset_by_line=column_offset_by_line,
+            target_filename=target_filename,
+        )
 
-    return issues_by_block
+        if issue is not None:
+            issues.append(issue)
+
+    return sort_issues(issues), parse_errors
+
+
+def sort_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        issues,
+        key=lambda issue: (
+            issue.get("line") if isinstance(issue.get("line"), int) else 10**9,
+            issue.get("column") if isinstance(issue.get("column"), int) else 10**9,
+            safe_text(issue.get("rule_id")),
+        ),
+    )
 
 
 # ============================================================
-# Dataset
+# C++ wrapping
+# ============================================================
+
+def is_cpp_preamble_line(line: str) -> bool:
+    stripped = line.strip()
+
+    return (
+        not stripped
+        or stripped.startswith("//")
+        or stripped.startswith("/*")
+        or stripped.startswith("*")
+        or stripped.startswith("*/")
+        or stripped.startswith("#")
+        or stripped.startswith("using ")
+        or stripped.startswith("namespace ")
+    )
+
+
+def split_cpp_preamble(
+    code: str,
+) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]]]:
+    leading: List[Tuple[int, str]] = []
+    body: List[Tuple[int, str]] = []
+
+    seen_body = False
+
+    for original_line_number, line in enumerate(safe_text(code).splitlines(), start=1):
+        if not seen_body and is_cpp_preamble_line(line):
+            leading.append((original_line_number, line))
+            continue
+
+        seen_body = True
+        body.append((original_line_number, line))
+
+    return leading, body
+
+
+def build_raw_candidate(code: str) -> Dict[str, Any]:
+    lines = safe_text(code).splitlines()
+
+    line_map = {
+        generated_line_number: generated_line_number
+        for generated_line_number in range(1, len(lines) + 1)
+    }
+
+    return {
+        "name": "raw",
+        "code": safe_text(code).strip("\n\r") + "\n",
+        "line_map": line_map,
+        "column_offset_by_line": {},
+    }
+
+
+def build_main_wrapper_candidate(code: str) -> Dict[str, Any]:
+    leading, body = split_cpp_preamble(code)
+
+    output_lines: List[str] = []
+    line_map: Dict[int, int] = {}
+    column_offset_by_line: Dict[int, int] = {}
+
+    for original_line_number, line in leading:
+        output_lines.append(line)
+        generated_line_number = len(output_lines)
+        line_map[generated_line_number] = original_line_number
+
+    output_lines.append("int main() {")
+
+    for original_line_number, line in body:
+        output_lines.append("    " + line)
+        generated_line_number = len(output_lines)
+        line_map[generated_line_number] = original_line_number
+        column_offset_by_line[generated_line_number] = 4
+
+    output_lines.append("    return 0;")
+    output_lines.append("}")
+
+    return {
+        "name": "main_wrapper",
+        "code": "\n".join(output_lines) + "\n",
+        "line_map": line_map,
+        "column_offset_by_line": column_offset_by_line,
+    }
+
+
+def build_cppcheck_candidates(code: str) -> List[Dict[str, Any]]:
+    return [
+        build_raw_candidate(code),
+        build_main_wrapper_candidate(code),
+    ]
+
+
+# ============================================================
+# Snippet saving
+# ============================================================
+
+def make_snippet_id(conversation_id: str, block_index: int) -> str:
+    return f"{conversation_id}__block_{block_index:03d}"
+
+
+def save_cpp_candidate(
+    root_dir: Path,
+    block_index: int,
+    candidate_name: str,
+    code: str,
+) -> Path:
+    candidate_dir = root_dir / safe_filename(candidate_name)
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+
+    path = candidate_dir / f"block_{block_index:03d}.cpp"
+    path.write_text(code, encoding="utf-8")
+
+    return path
+
+
+def save_debug_raw_blocks(
+    conversation_id: str,
+    cpp_blocks: List[Dict[str, Any]],
+) -> None:
+    conversation_dir = EXTRACTED_SNIPPETS_DIR / safe_filename(conversation_id)
+    conversation_dir.mkdir(parents=True, exist_ok=True)
+
+    for block in cpp_blocks:
+        block_index = int(block["block_index"])
+        path = conversation_dir / f"block_{block_index:03d}.cpp"
+        path.write_text(safe_text(block["code"]), encoding="utf-8")
+
+
+# ============================================================
+# C++ block analysis
+# ============================================================
+
+def analyze_cpp_candidate(
+    candidate_path: Path,
+    candidate: Dict[str, Any],
+) -> Tuple[str, List[Dict[str, Any]], List[str], Optional[str]]:
+    stdout, stderr = run_cppcheck(candidate_path)
+
+    stdout_text = safe_text(stdout).strip()
+    stderr_text = safe_text(stderr).strip()
+
+    xml_text = extract_xml_from_cppcheck_stderr(stderr_text)
+
+    if not xml_text and stderr_text:
+        return "tool_error", [], [], stderr_text
+
+    try:
+        issues, parse_errors = parse_cppcheck_output_for_file(
+            stderr=stderr_text,
+            target_file=candidate_path,
+            line_map=candidate["line_map"],
+            column_offset_by_line=candidate["column_offset_by_line"],
+        )
+    except Exception as exc:
+        return "tool_error", [], [], f"Failed to parse Cppcheck XML: {exc}"
+
+    return "ok", issues, parse_errors, None
+
+
+def analyze_cpp_block(
+    conversation_work_dir: Path,
+    block_index: int,
+    code: str,
+) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
+    last_parse_errors: List[str] = []
+
+    for candidate in build_cppcheck_candidates(code):
+        candidate_path = save_cpp_candidate(
+            root_dir=conversation_work_dir,
+            block_index=block_index,
+            candidate_name=candidate["name"],
+            code=candidate["code"],
+        )
+
+        status, issues, parse_errors, error = analyze_cpp_candidate(
+            candidate_path=candidate_path,
+            candidate=candidate,
+        )
+
+        if status == "tool_error":
+            return "tool_error", [], error
+
+        if parse_errors:
+            last_parse_errors = parse_errors
+            continue
+
+        return "ok", issues, None
+
+    error_message = "Cppcheck parse error after raw and wrapped analysis."
+
+    if last_parse_errors:
+        error_message += " Last error: " + " | ".join(last_parse_errors[:3])
+
+    return "parse_error", [], error_message
+
+
+# ============================================================
+# Dataset loading
 # ============================================================
 
 def load_parquet_files() -> List[Path]:
-    parquet_files = sorted(INPUT_DIR.glob("*.parquet"))
+    parquet_files = sorted(FINAL_DATASET_DIR.glob("*.parquet"))
 
     if MAX_FILES is not None:
         parquet_files = parquet_files[:MAX_FILES]
 
     if not parquet_files:
-        raise FileNotFoundError(f"No parquet files found in: {INPUT_DIR}")
+        raise FileNotFoundError(f"No parquet files found in: {FINAL_DATASET_DIR}")
 
     return parquet_files
 
 
-def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def filter_dataframe(
+    df: pd.DataFrame,
+    target_conversation_ids: Set[str],
+    completed_conversation_ids: Set[str],
+) -> pd.DataFrame:
     required_columns = {
         "conversation_id",
         "conversation",
-        "detected_language",
-        "task_category",
     }
 
     missing = required_columns - set(df.columns)
@@ -420,15 +788,11 @@ def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
     df = df.copy()
-
     df["conversation_id"] = df["conversation_id"].astype(str)
-    df["detected_language"] = df["detected_language"].astype(str).str.upper()
-    df["task_category"] = df["task_category"].astype(str).str.upper()
 
-    mask = (
-        df["detected_language"].isin(TARGET_NATURAL_LANGUAGES)
-        & df["task_category"].isin(TARGET_TASKS)
-    )
+    remaining_ids = target_conversation_ids - completed_conversation_ids
+
+    mask = df["conversation_id"].isin(remaining_ids)
 
     if TARGET_CONVERSATION_ID is not None:
         mask = mask & (df["conversation_id"] == str(TARGET_CONVERSATION_ID))
@@ -437,22 +801,18 @@ def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# Analysis
+# Output records
 # ============================================================
-
-def make_snippet_id(conversation_id: str, block_index: int) -> str:
-    return f"{conversation_id}__block_{block_index:03d}"
-
 
 def build_output_record(
     conversation_id: str,
     block_index: int,
     code: str,
+    status: str,
     issues: List[Dict[str, Any]],
-    status: str = "ok",
     error: Optional[str] = None,
 ) -> Dict[str, Any]:
-    record = {
+    record: Dict[str, Any] = {
         "snippet_id": make_snippet_id(conversation_id, block_index),
         "conversation_id": conversation_id,
         "block_index": block_index,
@@ -468,108 +828,77 @@ def build_output_record(
     return record
 
 
+# ============================================================
+# Conversation analysis
+# ============================================================
+
 def analyze_conversation(
     row: pd.Series,
     working_root_dir: Path,
     max_cpp_snippets: Optional[int] = None,
 ) -> int:
-    conversation_id = str(row["conversation_id"])
-    conversation_dir = get_conversation_dir(working_root_dir, conversation_id)
+    conversation_id = safe_text(row["conversation_id"]).strip()
+    cpp_blocks = extract_cpp_blocks(row["conversation"])
 
-    blocks = extract_code_blocks(row["conversation"])
-
-    cpp_blocks: Dict[int, Dict[str, Any]] = {}
-    cpp_files: List[Path] = []
-
-    for block in blocks:
-        block_index = int(block["block_index"])
-        language = block["programming_language"]
-        code = block["code"]
-
-        if SAVE_EXTRACTED_SNIPPETS:
-            saved_path = save_block(
-                conversation_dir=conversation_dir,
-                block_index=block_index,
-                programming_language=language,
-                code=code,
-            )
-        else:
-            saved_path = None
-
-        if language != "CPP":
-            continue
-
-        if max_cpp_snippets is not None and len(cpp_files) >= max_cpp_snippets:
-            continue
-
-        if saved_path is not None:
-            snippet_path = saved_path
-        else:
-            snippet_path = save_block(
-                conversation_dir=conversation_dir,
-                block_index=block_index,
-                programming_language="CPP",
-                code=code,
-            )
-
-        cpp_blocks[block_index] = {
-            "code": code,
-            "path": snippet_path,
-        }
-
-        cpp_files.append(snippet_path)
-
-    if not cpp_files:
+    if not cpp_blocks:
         return 0
 
-    try:
-        stdout, stderr = run_cppcheck(cpp_files)
-        issues_by_block = parse_cppcheck_output(stderr)
+    if max_cpp_snippets is not None:
+        cpp_blocks = cpp_blocks[:max_cpp_snippets]
 
-        for block_index, block_data in cpp_blocks.items():
-            issues = issues_by_block.get(block_index, [])
+    if not cpp_blocks:
+        return 0
 
-            record = build_output_record(
-                conversation_id=conversation_id,
+    conversation_work_dir = working_root_dir / safe_filename(conversation_id)
+    conversation_work_dir.mkdir(parents=True, exist_ok=True)
+
+    if SAVE_EXTRACTED_SNIPPETS:
+        save_debug_raw_blocks(
+            conversation_id=conversation_id,
+            cpp_blocks=cpp_blocks,
+        )
+
+    written = 0
+
+    for block in cpp_blocks:
+        block_index = int(block["block_index"])
+        code = safe_text(block["code"])
+
+        try:
+            status, issues, error = analyze_cpp_block(
+                conversation_work_dir=conversation_work_dir,
                 block_index=block_index,
-                code=block_data["code"],
-                issues=issues,
+                code=code,
             )
 
-            write_jsonl(CPPCHECK_OUTPUT_JSONL, record)
+        except subprocess.TimeoutExpired:
+            status = "timeout"
+            issues = []
+            error = f"Cppcheck timed out after {CPPCHECK_TIMEOUT_SECONDS} seconds."
 
-        return len(cpp_blocks)
+        except Exception as exc:
+            status = "tool_error"
+            issues = []
+            error = str(exc)
 
-    except subprocess.TimeoutExpired:
-        for block_index, block_data in cpp_blocks.items():
-            record = build_output_record(
-                conversation_id=conversation_id,
-                block_index=block_index,
-                code=block_data["code"],
-                issues=[],
-                status="timeout",
-                error=f"Cppcheck timed out after {CPPCHECK_TIMEOUT_SECONDS} seconds.",
-            )
+        record = build_output_record(
+            conversation_id=conversation_id,
+            block_index=block_index,
+            code=code,
+            status=status,
+            issues=issues if status == "ok" else [],
+            error=error,
+        )
 
-            write_jsonl(CPPCHECK_OUTPUT_JSONL, record)
+        write_jsonl(CPPCHECK_OUTPUT_JSONL, record)
+        written += 1
 
-        return len(cpp_blocks)
+    return written
 
-    except Exception as exc:
-        for block_index, block_data in cpp_blocks.items():
-            record = build_output_record(
-                conversation_id=conversation_id,
-                block_index=block_index,
-                code=block_data["code"],
-                issues=[],
-                status="tool_error",
-                error=str(exc),
-            )
 
-            write_jsonl(CPPCHECK_OUTPUT_JSONL, record)
-
-        return len(cpp_blocks)
-
+# ============================================================
+# Cleaning
+# ============================================================
 
 def clean_outputs() -> None:
     if not OVERWRITE_OUTPUTS:
@@ -578,84 +907,133 @@ def clean_outputs() -> None:
     if CPPCHECK_OUTPUT_JSONL.exists():
         CPPCHECK_OUTPUT_JSONL.unlink()
 
+    if CPPCHECK_PROGRESS_JSONL.exists():
+        CPPCHECK_PROGRESS_JSONL.unlink()
+
     if SAVE_EXTRACTED_SNIPPETS and EXTRACTED_SNIPPETS_DIR.exists():
         shutil.rmtree(EXTRACTED_SNIPPETS_DIR)
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def process_dataset(
+    target_conversation_ids: Set[str],
+    completed_conversation_ids: Set[str],
+    working_root_dir: Path,
+) -> Dict[str, int]:
+    counters = {
+        "processed_conversations": 0,
+        "skipped_completed_conversations": len(completed_conversation_ids),
+        "conversations_with_cpp": 0,
+        "analyzed_cpp_snippets": 0,
+    }
+
+    for parquet_path in tqdm(load_parquet_files(), desc="Parquet files"):
+        df = pd.read_parquet(parquet_path)
+
+        df = filter_dataframe(
+            df=df,
+            target_conversation_ids=target_conversation_ids,
+            completed_conversation_ids=completed_conversation_ids,
+        )
+
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Conversations", leave=False):
+            if (
+                MAX_CONVERSATIONS is not None
+                and counters["processed_conversations"] >= MAX_CONVERSATIONS
+            ):
+                return counters
+
+            if (
+                MAX_SNIPPETS is not None
+                and counters["analyzed_cpp_snippets"] >= MAX_SNIPPETS
+            ):
+                return counters
+
+            conversation_id = safe_text(row["conversation_id"]).strip()
+
+            if conversation_id in completed_conversation_ids:
+                continue
+
+            remaining_snippets = None
+
+            if MAX_SNIPPETS is not None:
+                remaining_snippets = (
+                    MAX_SNIPPETS - counters["analyzed_cpp_snippets"]
+                )
+
+            analyzed_count = analyze_conversation(
+                row=row,
+                working_root_dir=working_root_dir,
+                max_cpp_snippets=remaining_snippets,
+            )
+
+            write_progress(
+                conversation_id=conversation_id,
+                cpp_snippet_count=analyzed_count,
+            )
+
+            completed_conversation_ids.add(conversation_id)
+
+            counters["processed_conversations"] += 1
+            counters["analyzed_cpp_snippets"] += analyzed_count
+
+            if analyzed_count > 0:
+                counters["conversations_with_cpp"] += 1
+
+    return counters
+
+
+def print_summary(counters: Dict[str, int]) -> None:
+    print()
+    print(f"Target tasks: {sorted(TARGET_TASKS)}")
+    print(f"Processed conversations in this run: {counters['processed_conversations']}")
+    print(f"Already completed conversations skipped: {counters['skipped_completed_conversations']}")
+    print(f"Conversations with C++ snippets in this run: {counters['conversations_with_cpp']}")
+    print(f"Analyzed C++ snippets in this run: {counters['analyzed_cpp_snippets']}")
+    print(f"Results saved to: {CPPCHECK_OUTPUT_JSONL}")
+    print(f"Progress saved to: {CPPCHECK_PROGRESS_JSONL}")
+
+    if SAVE_EXTRACTED_SNIPPETS:
+        print(f"Extracted snippets saved to: {EXTRACTED_SNIPPETS_DIR}")
 
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     clean_outputs()
 
-    parquet_files = load_parquet_files()
+    task_by_conversation_id = load_target_task_records()
+    target_conversation_ids = set(task_by_conversation_id.keys())
 
-    analyzed_snippets = 0
-    processed_conversations = 0
+    if not target_conversation_ids:
+        raise ValueError(
+            f"No conversations found for TARGET_TASKS={sorted(TARGET_TASKS)}"
+        )
+
+    completed_conversation_ids = load_completed_conversation_ids()
 
     if SAVE_EXTRACTED_SNIPPETS:
-        working_root_dir = EXTRACTED_SNIPPETS_DIR
+        EXTRACTED_SNIPPETS_DIR.mkdir(parents=True, exist_ok=True)
+        working_root_dir = EXTRACTED_SNIPPETS_DIR / "_tmp_cppcheck_work"
         working_root_dir.mkdir(parents=True, exist_ok=True)
 
-        for parquet_path in tqdm(parquet_files, desc="Parquet files"):
-            df = pd.read_parquet(parquet_path)
-            df = filter_dataframe(df)
-
-            for _, row in tqdm(df.iterrows(), total=len(df), desc="Conversations", leave=False):
-                if MAX_CONVERSATIONS is not None and processed_conversations >= MAX_CONVERSATIONS:
-                    print(f"Analyzed C++ snippets: {analyzed_snippets}")
-                    return
-
-                if MAX_SNIPPETS is not None and analyzed_snippets >= MAX_SNIPPETS:
-                    print(f"Analyzed C++ snippets: {analyzed_snippets}")
-                    return
-
-                remaining = None
-                if MAX_SNIPPETS is not None:
-                    remaining = MAX_SNIPPETS - analyzed_snippets
-
-                analyzed_count = analyze_conversation(
-                    row=row,
-                    working_root_dir=working_root_dir,
-                    max_cpp_snippets=remaining,
-                )
-
-                analyzed_snippets += analyzed_count
-                processed_conversations += 1
+        counters = process_dataset(
+            target_conversation_ids=target_conversation_ids,
+            completed_conversation_ids=completed_conversation_ids,
+            working_root_dir=working_root_dir,
+        )
 
     else:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            working_root_dir = Path(tmp_dir)
+            counters = process_dataset(
+                target_conversation_ids=target_conversation_ids,
+                completed_conversation_ids=completed_conversation_ids,
+                working_root_dir=Path(tmp_dir),
+            )
 
-            for parquet_path in tqdm(parquet_files, desc="Parquet files"):
-                df = pd.read_parquet(parquet_path)
-                df = filter_dataframe(df)
-
-                for _, row in tqdm(df.iterrows(), total=len(df), desc="Conversations", leave=False):
-                    if MAX_CONVERSATIONS is not None and processed_conversations >= MAX_CONVERSATIONS:
-                        print(f"Analyzed C++ snippets: {analyzed_snippets}")
-                        return
-
-                    if MAX_SNIPPETS is not None and analyzed_snippets >= MAX_SNIPPETS:
-                        print(f"Analyzed C++ snippets: {analyzed_snippets}")
-                        return
-
-                    remaining = None
-                    if MAX_SNIPPETS is not None:
-                        remaining = MAX_SNIPPETS - analyzed_snippets
-
-                    analyzed_count = analyze_conversation(
-                        row=row,
-                        working_root_dir=working_root_dir,
-                        max_cpp_snippets=remaining,
-                    )
-
-                    analyzed_snippets += analyzed_count
-                    processed_conversations += 1
-
-    print(f"Analyzed C++ snippets: {analyzed_snippets}")
-    print(f"Results saved to: {CPPCHECK_OUTPUT_JSONL}")
-
-    if SAVE_EXTRACTED_SNIPPETS:
-        print(f"Extracted snippets saved to: {EXTRACTED_SNIPPETS_DIR}")
+    print_summary(counters)
 
 
 if __name__ == "__main__":

@@ -9,10 +9,10 @@ from ice_score_utils import PROJECT_ROOT, is_valid_score, safe_text, write_jsonl
 # Configuration
 # ============================================================
 
-USEFULNESS_JSONL = PROJECT_ROOT / "data/ice_score/ice_usefulness_lmstudio.jsonl"
-CORRECTNESS_JSONL = PROJECT_ROOT / "data/ice_score/ice_correctness_lmstudio.jsonl"
+USEFULNESS_JSONL = PROJECT_ROOT / "data/ice_score/ice_usefulness.jsonl"
+CORRECTNESS_JSONL = PROJECT_ROOT / "data/ice_score/ice_correctness.jsonl"
 
-OUTPUT_JSONL = PROJECT_ROOT / "data/ice_score/ice_score_lmstudio_merged.jsonl"
+OUTPUT_JSONL = PROJECT_ROOT / "data/ice_score/ice_score_final.jsonl"
 
 OVERWRITE_OUTPUT = True
 

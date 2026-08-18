@@ -15,77 +15,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 # ============================================================
-# ICE prompt templates
-# ============================================================
-
-ICE_CORRECTNESS_PROMPT_TEMPLATE = """\
-##### TASK #####
-You will be given the code snippet for a problem. 
-Your task is to rate the code snippet only on one metric.
-Please make sure you read and understand these instructions carefully.
-Please keep this document open while reviewing, and refer to it as needed.
-
-##### EVALUATION CRITERIA #####
-Functional Correctness (0-4) - Execution-based quality of the code snippet combined with the problem. The correctness is measured by the all possible unit tests, and the comparison of the reference code. The combination of the code snippet and the problem should pass all the possible tests based on your understanding of the reference code. The length of the code snippet can not determine the correctness. You need to assess the logics line by line.
-- A score of 0  (failing all possible test) means that the code snippet is totally incorrect and meaningless.
-- A score of 4  (passing all possible test) means that the code snippet is totally correct and can handle all cases.
-
-
-##### EVALUATION STEPS #####
-1. Read the problem carefully and identify required functionalities of the implementation.
-2. Read the code snippet and compare it to the problem. Check if the code snippet covers all required functionalities of the problem. 
-3. Assign a score for functional correctness on a scale of 0 to 4, where 0 is the lowest and 4 is the highest based on the Evaluation Criteria.
-
-##### PROBLEM #####
-
-{{PROBLEM}}
-
-##### CODE SNIPPETS #####
-
-{{OUTPUT}}
-
-##### EVALUATION FORM #####
-Functional Correctness
-Step-by-step Evaluation:
-"""
-
-
-ICE_USEFULNESS_PROMPT_TEMPLATE = """\
-##### TASK #####
-You will be given the code snippet for a problem.
-Your task is to rate the code snippet only on one metric.
-Please make sure you read and understand these instructions carefully.
-Please keep this document open while reviewing, and refer to it as needed.
-
-##### EVALUATION CRITERIA #####
-Usefulness (0-4) Usefulness of the code snippet based on the problem description.
-
-- A score of 0: Snippet is not at all helpful, it is irrelevant to the problem.
-- A score of 1: Snippet is slightly helpful, it contains information relevant to the problem, but it is easier to write the solution from scratch.
-- A score of 2: Snippet is somewhat helpful, it requires significant changes (compared to the size of the snippet), but is still useful.
-- A score of 3: Snippet is helpful, but needs to be slightly changed to solve the problem.
-- A score of 4: Snippet is very helpful, it solves the problem.
-
-##### EVALUATION STEPS #####
-1. Read the problem carefully and identify required functionalities of the implementation.
-2. Read the code snippet and compare it to the problem. Check if the code snippet covers all required functionalities of the problem, and if it presents them in a clear and logical order. 
-3. Assign a score for usefulness on a scale of 0 to 4, where 0 is the lowest and 4 is the highest based on the Evaluation Criteria.
-
-##### PROBLEM #####
-
-{{PROBLEM}}
-
-##### CODE SNIPPETS #####
-
-{{OUTPUT}}
-
-##### EVALUATION FORM #####
-Usefulness
-Step-by-step Evaluation:
-"""
-
-
-# ============================================================
 # Basic utilities
 # ============================================================
 
@@ -173,12 +102,19 @@ def iter_messages(conversation: Any) -> Iterable[Dict[str, Any]]:
             yield from iter_messages(item)
 
 
-def get_first_user_prompt(conversation: Any) -> str:
+def get_first_user_natural_language_text(conversation: Any) -> str:
+    """
+    Returns only the natural-language part of the first user prompt.
+
+    Important:
+    ICE-Score receives only natural_language_text as the Problem,
+    not the full original prompt with user-provided code.
+    """
     for message in iter_messages(conversation):
         role = safe_text(message.get("role")).strip().lower()
 
         if role == "user":
-            return safe_text(message.get("content"))
+            return safe_text(message.get("natural_language_text"))
 
     return ""
 
@@ -205,24 +141,45 @@ def get_first_assistant_response(conversation: Any) -> str:
 # ============================================================
 
 CODE_BLOCK_PATTERN = re.compile(
-    r"```([^\n`]*)\n(.*?)```",
-    flags=re.DOTALL,
+    r"""
+    ```
+    (?:
+        [^\n`]*\n(?P<multiline>.*?)
+        |
+        (?P<singleline>[^\n`]*?)
+    )
+    ```
+    """,
+    flags=re.DOTALL | re.VERBOSE,
 )
 
 
 def extract_code_blocks_from_response(response_text: str) -> List[str]:
     """
-    Extracts only code blocks enclosed in triple backticks.
+    Extracts code blocks enclosed in triple backticks.
+
+    If no non-empty fenced code block is found, falls back to returning the
+    entire assistant response as a single code snippet.
     """
+    response_text = safe_text(response_text)
     blocks = []
 
-    for match in CODE_BLOCK_PATTERN.finditer(safe_text(response_text)):
-        code = match.group(2).strip("\n\r")
+    for match in CODE_BLOCK_PATTERN.finditer(response_text):
+        code = match.group("multiline")
+
+        if code is None:
+            code = match.group("singleline")
+
+        code = safe_text(code).strip("\n\r")
 
         if code.strip():
             blocks.append(code)
 
-    return blocks
+    if blocks:
+        return blocks
+
+    fallback = response_text.strip()
+    return [fallback] if fallback else []
 
 
 def format_code_blocks_for_ice(code_blocks: List[str]) -> str:
@@ -244,28 +201,212 @@ def format_code_blocks_for_ice(code_blocks: List[str]) -> str:
 
 
 # ============================================================
-# ICE prompt and score extraction
+# ICE system/user prompts
 # ============================================================
 
-def build_ice_prompt(problem: str, output: str, aspect: str) -> str:
+def build_ice_system_prompt(aspect: str) -> str:
+    """
+    Builds the system prompt containing:
+    task definition, evaluation criteria, evaluation steps, and output format.
+    """
     if aspect == "correctness":
-        template = ICE_CORRECTNESS_PROMPT_TEMPLATE
-    elif aspect == "usefulness":
-        template = ICE_USEFULNESS_PROMPT_TEMPLATE
-    else:
-        raise ValueError(f"Unknown ICE aspect: {aspect}")
+        return """\
+##### TASK #####
+You will be given the code snippet for a problem. 
+Your task is to rate the code snippet only on one metric.
+Please make sure you read and understand these instructions carefully.
+Please keep this document open while reviewing, and refer to it as needed.
 
-    return (
-        template
-        .replace("{{PROBLEM}}", problem)
-        .replace("{{OUTPUT}}", output)
+##### EVALUATION CRITERIA #####
+Functional Correctness (0-4) - Execution-based quality of the code snippet combined with the problem. The correctness is measured by the all possible unit tests, and the comparison of the reference code. The combination of the code snippet and the problem should pass all the possible tests based on your understanding of the reference code. The length of the code snippet can not determine the correctness. You need to assess the logics line by line.
+- A score of 0  (failing all possible test) means that the code snippet is totally incorrect and meaningless.
+- A score of 4  (passing all possible test) means that the code snippet is totally correct and can handle all cases.
+
+##### EVALUATION STEPS #####
+1. Read the problem carefully and identify required functionalities of the implementation.
+2. Read the code snippet and compare it to the problem. Check if the code snippet covers all required functionalities of the problem. 
+3. Assign a score for functional correctness on a scale of 0 to 4, where 0 is the lowest and 4 is the highest based on the Evaluation Criteria.
+
+##### OUTPUT FORMAT #####
+Return only a valid JSON object with this exact structure:
+{"score": score}
+""".strip()
+
+    if aspect == "usefulness":
+        return """\
+##### TASK #####
+You will be given the code snippet for a problem.
+Your task is to rate the code snippet only on one metric.
+Please make sure you read and understand these instructions carefully.
+Please keep this document open while reviewing, and refer to it as needed.
+
+##### EVALUATION CRITERIA #####
+Usefulness (0-4) Usefulness of the code snippet based on the problem description.
+
+- A score of 0: Snippet is not at all helpful, it is irrelevant to the problem.
+- A score of 1: Snippet is slightly helpful, it contains information relevant to the problem, but it is easier to write the solution from scratch.
+- A score of 2: Snippet is somewhat helpful, it requires significant changes (compared to the size of the snippet), but is still useful.
+- A score of 3: Snippet is helpful, but needs to be slightly changed to solve the problem.
+- A score of 4: Snippet is very helpful, it solves the problem.
+
+##### EVALUATION STEPS #####
+1. Read the problem carefully and identify required functionalities of the implementation.
+2. Read the code snippet and compare it to the problem. Check if the code snippet covers all required functionalities of the problem, and if it presents them in a clear and logical order. 
+3. Assign a score for usefulness on a scale of 0 to 4, where 0 is the lowest and 4 is the highest based on the Evaluation Criteria.
+
+##### OUTPUT FORMAT #####
+Return only a valid JSON object with this exact structure:
+{"score": score}
+""".strip()
+
+    raise ValueError(f"Unknown ICE aspect: {aspect}")
+
+
+def build_ice_user_prompt(problem: str, output: str) -> str:
+    """
+    Builds the user prompt containing only instance-specific data:
+    Problem and Code Snippets.
+    """
+    return f"""\
+##### PROBLEM #####:
+
+{problem}
+
+##### CODE SNIPPETS #####
+
+{output}
+""".strip()
+
+
+def build_ice_response_format(aspect: str) -> Dict[str, Any]:
+    """
+    Forces the model to return:
+    {"score": 0|1|2|3|4}
+    """
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": f"ice_{aspect}_score",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "score": {
+                        "type": "integer",
+                        "enum": [0, 1, 2, 3, 4],
+                    }
+                },
+                "required": ["score"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def save_debug_prompt(
+    debug_prompts_dir: Path,
+    conversation_id: str,
+    aspect: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> None:
+    debug_prompts_dir.mkdir(parents=True, exist_ok=True)
+
+    conversation_dir = debug_prompts_dir / safe_filename(conversation_id)
+    conversation_dir.mkdir(parents=True, exist_ok=True)
+
+    path = conversation_dir / f"{aspect}_prompt.txt"
+
+    debug_text = (
+        "##### SYSTEM #####\n"
+        f"{system_prompt}\n\n"
+        "##### USER #####\n"
+        f"{user_prompt}"
     )
+
+    path.write_text(debug_text, encoding="utf-8")
+
+
+# ============================================================
+# OpenAI API and score extraction
+# ============================================================
+
+def call_openai_chat_completion(
+    system_prompt: str,
+    user_prompt: str,
+    aspect: str,
+    api_base: str,
+    api_key: str,
+    model: str,
+    temperature: float,
+    request_timeout_seconds: int,
+    retries: int,
+    retry_sleep_seconds: int,
+) -> str:
+    """
+    Sends one ICE-Score request to the OpenAI Chat Completions API.
+    Uses Structured Outputs to force a JSON score.
+    """
+    if not api_key:
+        raise ValueError(
+            "Missing OpenAI API key. Set the OPENAI_API_KEY environment variable."
+        )
+
+    url = api_base.rstrip("/") + "/chat/completions"
+
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
+        ],
+        "temperature": temperature,
+        "response_format": build_ice_response_format(aspect),
+    }
+
+    headers: Dict[str, str] = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    last_error: Optional[Exception] = None
+
+    for attempt in range(retries + 1):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=request_timeout_seconds,
+            )
+
+            if not response.ok:
+                raise RuntimeError(
+                    f"OpenAI API error {response.status_code}: {response.text[:1000]}"
+                )
+
+            data = response.json()
+            return safe_text(data["choices"][0]["message"]["content"]).strip()
+
+        except Exception as exc:
+            last_error = exc
+
+            if attempt < retries:
+                time.sleep(retry_sleep_seconds)
+
+    raise RuntimeError(f"OpenAI request failed: {last_error}")
 
 
 def extract_score_from_raw_response(raw_content: str, aspect: str) -> int:
     """
-    Rule-based extraction inspired by the ICE-Score repository.
-    Expected score: integer from 0 to 4.
+    Fallback rule-based extraction inspired by the ICE-Score repository.
+    Used only if JSON parsing fails.
     """
     content = safe_text(raw_content).strip()
 
@@ -316,62 +457,33 @@ def extract_score_from_raw_response(raw_content: str, aspect: str) -> int:
     raise ValueError(f"Could not extract score from response: {content[:500]}")
 
 
-# ============================================================
-# LM Studio
-# ============================================================
+def extract_score_from_json_response(raw_content: str, aspect: str) -> int:
+    """
+    Extracts the ICE score from the JSON response.
+    Falls back to rule-based parsing only if JSON parsing fails.
+    """
+    content = safe_text(raw_content).strip()
 
-def call_lm_studio(
-    prompt: str,
-    api_base: str,
-    api_key: str,
-    model: str,
-    prompt_role: str,
-    temperature: float,
-    request_timeout_seconds: int,
-    retries: int,
-    retry_sleep_seconds: int,
-) -> str:
-    url = api_base.rstrip("/") + "/chat/completions"
+    try:
+        obj = json.loads(content)
+        score = obj.get("score")
 
-    payload: Dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {
-                "role": prompt_role,
-                "content": prompt,
-            }
-        ],
-        "temperature": temperature,
-    }
+        if isinstance(score, int) and 0 <= score <= 4:
+            return score
 
-    headers: Dict[str, str] = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
+        if isinstance(score, str) and score.strip().isdigit():
+            score_int = int(score.strip())
 
-    last_error: Optional[Exception] = None
+            if 0 <= score_int <= 4:
+                return score_int
 
-    for attempt in range(retries + 1):
-        try:
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=request_timeout_seconds,
-            )
+        raise ValueError(f"Invalid JSON score: {obj}")
 
-            response.raise_for_status()
-
-            data = response.json()
-            return safe_text(data["choices"][0]["message"]["content"]).strip()
-
-        except Exception as exc:
-            last_error = exc
-
-            if attempt < retries:
-                time.sleep(retry_sleep_seconds)
-
-    raise RuntimeError(f"LM Studio request failed: {last_error}")
+    except Exception:
+        return extract_score_from_raw_response(
+            raw_content=raw_content,
+            aspect=aspect,
+        )
 
 
 # ============================================================
@@ -538,19 +650,6 @@ def make_error_record(
     }
 
 
-def save_debug_prompt(
-    debug_prompts_dir: Path,
-    conversation_id: str,
-    aspect: str,
-    prompt: str,
-) -> None:
-    conversation_dir = debug_prompts_dir / safe_filename(conversation_id)
-    conversation_dir.mkdir(parents=True, exist_ok=True)
-
-    path = conversation_dir / f"{aspect}_prompt.txt"
-    path.write_text(prompt, encoding="utf-8")
-
-
 def evaluate_row_for_aspect(
     row: Dict[str, Any],
     aspect: str,
@@ -558,7 +657,6 @@ def evaluate_row_for_aspect(
     api_base: str,
     api_key: str,
     model: str,
-    prompt_role: str,
     temperature: float,
     request_timeout_seconds: int,
     retries: int,
@@ -568,19 +666,24 @@ def evaluate_row_for_aspect(
     save_raw_responses: bool,
 ) -> Dict[str, Any]:
     """
-    Extracts prompt and generated code blocks, builds the ICE prompt,
-    sends one request to LM Studio, and returns one JSONL record.
+    Extracts:
+    - Problem from first user message natural_language_text only
+    - Code Snippets from assistant response fenced code blocks
+
+    Then sends:
+    - system prompt: task, criteria, steps, output format
+    - user prompt: Problem and Code Snippets
     """
     conversation_id = safe_text(row.get("conversation_id")).strip()
 
     try:
         conversation = row["conversation"]
 
-        problem = get_first_user_prompt(conversation)
+        problem = get_first_user_natural_language_text(conversation)
         assistant_response = get_first_assistant_response(conversation)
 
         if not problem.strip():
-            raise ValueError("Missing first user prompt.")
+            raise ValueError("Missing natural_language_text in first user message.")
 
         if not assistant_response.strip():
             raise ValueError("Missing first assistant response.")
@@ -592,10 +695,10 @@ def evaluate_row_for_aspect(
 
         output = format_code_blocks_for_ice(code_blocks)
 
-        prompt = build_ice_prompt(
+        system_prompt = build_ice_system_prompt(aspect)
+        user_prompt = build_ice_user_prompt(
             problem=problem,
             output=output,
-            aspect=aspect,
         )
 
         if save_debug_prompts:
@@ -603,22 +706,24 @@ def evaluate_row_for_aspect(
                 debug_prompts_dir=debug_prompts_dir,
                 conversation_id=conversation_id,
                 aspect=aspect,
-                prompt=prompt,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
             )
 
-        raw_response = call_lm_studio(
-            prompt=prompt,
+        raw_response = call_openai_chat_completion(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            aspect=aspect,
             api_base=api_base,
             api_key=api_key,
             model=model,
-            prompt_role=prompt_role,
             temperature=temperature,
             request_timeout_seconds=request_timeout_seconds,
             retries=retries,
             retry_sleep_seconds=retry_sleep_seconds,
         )
 
-        score = extract_score_from_raw_response(
+        score = extract_score_from_json_response(
             raw_content=raw_response,
             aspect=aspect,
         )
@@ -660,7 +765,6 @@ def run_ice_aspect_pipeline(
     api_base: str,
     api_key: str,
     model: str,
-    prompt_role: str,
     temperature: float,
     request_timeout_seconds: int,
     retries: int,
@@ -670,6 +774,7 @@ def run_ice_aspect_pipeline(
     save_raw_responses: bool,
 ) -> None:
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+
     clean_output(
         output_jsonl=output_jsonl,
         overwrite_output=overwrite_output,
@@ -723,7 +828,6 @@ def run_ice_aspect_pipeline(
                 api_base,
                 api_key,
                 model,
-                prompt_role,
                 temperature,
                 request_timeout_seconds,
                 retries,

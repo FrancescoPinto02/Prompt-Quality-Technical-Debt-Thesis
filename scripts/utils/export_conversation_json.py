@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 INPUT_DIR = Path("data/final/v1")
 
-CONVERSATION_ID = "787000e9fc942c97befd11560b23540c"
+CONVERSATION_ID = "2997464797895fb57cfa9815a25e3d90"
 
 OUTPUT_DIR = Path("data/debug/conversations")
 OUTPUT_JSON = OUTPUT_DIR / f"{CONVERSATION_ID}.json"

@@ -1,4 +1,4 @@
-from pathlib import Path
+import os
 from typing import Optional, Set
 
 from ice_score_utils import PROJECT_ROOT, run_ice_aspect_pipeline
@@ -29,20 +29,19 @@ MAX_CONVERSATIONS: Optional[int] = None
 OVERWRITE_OUTPUT = False
 RESUME = True
 
-WORKERS = 4
+WORKERS = 1
 
-API_BASE = "http://localhost:1234/v1"
-API_KEY = "lm-studio"
-MODEL = "google/gemma-4-12b-qat"
+API_BASE = "https://api.openai.com/v1"
+API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+MODEL = "gpt-5.4-nano"
 
 REQUEST_TIMEOUT_SECONDS = 180
 RETRIES = 0
 RETRY_SLEEP_SECONDS = 2
 TEMPERATURE = 0.0
 
-ICE_PROMPT_ROLE = "system"
-
-SAVE_DEBUG_PROMPTS = False
+SAVE_DEBUG_PROMPTS = True
 DEBUG_PROMPTS_DIR = PROJECT_ROOT / "data/ice_score/debug"
 
 SAVE_RAW_RESPONSES = False
@@ -68,7 +67,6 @@ def main() -> None:
         api_base=API_BASE,
         api_key=API_KEY,
         model=MODEL,
-        prompt_role=ICE_PROMPT_ROLE,
         temperature=TEMPERATURE,
         request_timeout_seconds=REQUEST_TIMEOUT_SECONDS,
         retries=RETRIES,
