@@ -74,36 +74,18 @@ VALID_TOPICS: Set[str] = {
 # Prompt
 # ============================================================
 
-SYSTEM_PROMPT = """
-##### SYSTEM #####
-You are an expert annotator for an empirical software engineering study.
-Your task is to classify developer prompts sent to LLMs based on the main technical topic or domain discussed in the conversation.
-You must assign exactly one topic category based on the user's primary domain of concern.
-Return only valid JSON. Do not include explanations, markdown, comments, or extra text.
+PROMPT_DIR = PROJECT_ROOT / "prompt" / "intent_classification"
+TOPIC_SYSTEM_PROMPT_PATH = PROMPT_DIR / "TopicClassificationSystemPrompt.txt"
 
-##### TASK #####
-Classify the given user prompt into exactly one of the following topic categories:
-1-WEB_UI_DEVELOPMENT: Frontend development, UI components, layout, visual interactions, user interfaces, browser behavior and graphical interaction.
-2-DATA_ANALYTICS: Data management, data transformation, data analysis, data visualization, DataFrames, Excel/VBA, analytics workflows, trading workflows, and data-oriented automation.
-3-SYSTEMS_NETWORKING: Low-level programming, memory management, assembly, binary patching, networking, cryptography, protocols, sockets, and systems-level concerns.
-4-BACKEND_DEVELOPMENT: Server-side development, SQL schemas, ORM, APIs, microservices, caching, backend frameworks, databases, services, and distributed applications.
-5-MACHINE_LEARNING_AI: Training, deployment, integration, or use of ML/AI models, bots, inference pipelines, AI automation, NLP, computer vision models, and model-serving workflows.
-6-ALGORITHMS_COMPUTATIONAL_PROBLEMS: Algorithms, data structures, regex/text processing, optimization problems, computational tasks, functional programming, and general programming puzzles.
-7-MEDIA_SIGNAL_PROCESSING: Image, audio, video, streaming, signal processing, multimedia processing, and computational analysis of multimedia data.
-8-GAME_DEVELOPMENT: Game development, gameplay logic, controls, inventory, player-object interactions, game mechanics, engines, levels, and game UI logic.
-9-DEVOPS: Development environment, package management, version control, automation, containerization, CI/CD, deployment, application security, build tools, and system administration.
-10-OTHER: technical topic is unclear or does not fit any category above.
 
-##### OUTPUT FORMAT #####
-Return only this JSON object:
-{"topic":"CATEGORY"}
+def load_text_file(path: Path) -> str:
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt file not found: {path}")
 
-##### EXAMPLE #####
-Input:
-Create a React component with a responsive sidebar and a dropdown menu.
-Output:
-{"topic":"WEB_UI_DEVELOPMENT"}
-""".strip()
+    return path.read_text(encoding="utf-8").strip()
+
+
+SYSTEM_PROMPT = load_text_file(TOPIC_SYSTEM_PROMPT_PATH)
 
 
 # ============================================================

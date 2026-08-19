@@ -1,4 +1,3 @@
-import argparse
 import hashlib
 import json
 import re
@@ -10,6 +9,41 @@ import pandas as pd
 from tqdm import tqdm
 from datasketch import MinHashLSH
 from rapidfuzz import fuzz
+
+
+# ============================================================
+# Directory configuration
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+RAW_DATASET_DIR = PROJECT_ROOT / "data/raw"
+FILTERED_DATASET_DIR = PROJECT_ROOT / "data/filtered1"
+FILTER_REPORT_DIR = FILTERED_DATASET_DIR / "report"
+
+
+# ============================================================
+# Active filtering configuration
+# ============================================================
+
+FILTER_NON_ENGLISH = True
+ENGLISH_LABELS = {"english", "en", "eng"}
+
+FILTER_MULTITURN = True
+SINGLE_TURN_METHOD = "both"
+
+DROP_EMPTY_FIRST_PROMPT = True
+
+DUPLICATE_STRATEGY = "fuzzy"
+DUPLICATE_MODE = "drop_all"
+FUZZY_PREFIX_CHARS = 1000
+FUZZY_THRESHOLD = 90.0
+
+ROWS_PER_OUTPUT_FILE = 10_000
+MAX_FILES: Optional[int] = None
+MAX_ROWS_PER_FILE: Optional[int] = None
+
+OVERWRITE_OUTPUTS = True
 
 
 # ============================================================
@@ -1213,7 +1247,7 @@ def clean_output_dir(output_dir: Path, overwrite: bool) -> None:
         if existing_parquet and not overwrite:
             raise FileExistsError(
                 f"Output directory {output_dir} already contains parquet files. "
-                f"Use --overwrite to replace them."
+                f"Set OVERWRITE_OUTPUTS=True to replace them."
             )
 
         if overwrite:
@@ -1607,7 +1641,6 @@ def save_duplicate_pairs_sample(
 def save_reports(
     report_dir: Path,
     filtered_metadata: pd.DataFrame,
-    args: argparse.Namespace,
 ) -> None:
     """Saves filtering decisions and summary statistics."""
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -1650,16 +1683,16 @@ def save_reports(
     ]["fuzzy_duplicate_group_size"]
 
     summary = {
-        "input_dir": str(args.input_dir),
-        "output_dir": str(args.output_dir),
-        "filter_non_english": args.filter_non_english,
-        "filter_multiturn": args.filter_multiturn,
-        "single_turn_method": args.single_turn_method,
-        "duplicate_strategy": args.duplicate_strategy,
-        "duplicate_mode": args.duplicate_mode,
-        "drop_empty_first_prompt": args.drop_empty_first_prompt,
-        "fuzzy_prefix_chars": args.fuzzy_prefix_chars,
-        "fuzzy_threshold": args.fuzzy_threshold,
+        "input_dir": str(RAW_DATASET_DIR),
+        "output_dir": str(FILTERED_DATASET_DIR),
+        "filter_non_english": FILTER_NON_ENGLISH,
+        "filter_multiturn": FILTER_MULTITURN,
+        "single_turn_method": SINGLE_TURN_METHOD,
+        "duplicate_strategy": DUPLICATE_STRATEGY,
+        "duplicate_mode": DUPLICATE_MODE,
+        "drop_empty_first_prompt": DROP_EMPTY_FIRST_PROMPT,
+        "fuzzy_prefix_chars": FUZZY_PREFIX_CHARS,
+        "fuzzy_threshold": FUZZY_THRESHOLD,
 
         "total_records": int(len(filtered_metadata)),
         "kept_records": int(filtered_metadata["keep_final"].sum()),
@@ -1753,174 +1786,63 @@ def save_reports(
 
 
 # ============================================================
-# CLI
+# Main
 # ============================================================
 
+def print_configuration() -> None:
+    print("Filtering configuration")
+    print(f"Raw dataset directory: {RAW_DATASET_DIR}")
+    print(f"Filtered dataset directory: {FILTERED_DATASET_DIR}")
+    print(f"Report directory: {FILTER_REPORT_DIR}")
+    print(f"Filter non-English records: {FILTER_NON_ENGLISH}")
+    print(f"English labels: {sorted(ENGLISH_LABELS)}")
+    print(f"Filter multi-turn records: {FILTER_MULTITURN}")
+    print(f"Single-turn method: {SINGLE_TURN_METHOD}")
+    print(f"Drop empty first prompts: {DROP_EMPTY_FIRST_PROMPT}")
+    print(f"Duplicate strategy: {DUPLICATE_STRATEGY}")
+    print(f"Duplicate mode: {DUPLICATE_MODE}")
+    print(f"Fuzzy prefix chars: {FUZZY_PREFIX_CHARS}")
+    print(f"Fuzzy threshold: {FUZZY_THRESHOLD}")
+    print(f"Rows per output file: {ROWS_PER_OUTPUT_FILE}")
+    print(f"Max files: {MAX_FILES}")
+    print(f"Max rows per file: {MAX_ROWS_PER_FILE}")
+    print(f"Overwrite outputs: {OVERWRITE_OUTPUTS}")
+    print()
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Apply preliminary filters to CodeChat parquet files before "
-            "LLM-based code/NL separation and task/language classification."
-        )
-    )
-
-    parser.add_argument(
-        "--input-dir",
-        type=Path,
-        default=Path("data/raw"),
-        help="Directory containing raw parquet files.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("data/filtered"),
-        help="Directory where filtered parquet shards will be saved.",
-    )
-    parser.add_argument(
-        "--report-dir",
-        type=Path,
-        default=Path("data/filtered/report"),
-        help="Directory where filtering reports will be saved.",
-    )
-
-    parser.add_argument(
-        "--filter-non-english",
-        action="store_true",
-        help=(
-            "Remove records whose first user message language label is not English "
-            "according to the dataset annotation."
-        ),
-    )
-    parser.add_argument(
-        "--english-labels",
-        type=str,
-        default="english,en,eng",
-        help=(
-            "Comma-separated list of labels considered English after normalization. "
-            "Default: english,en,eng"
-        ),
-    )
-
-    parser.add_argument(
-        "--filter-multiturn",
-        action="store_true",
-        help="Remove conversations that are not single-turn.",
-    )
-    parser.add_argument(
-        "--single-turn-method",
-        choices=["turn_column", "user_message_count", "both"],
-        default="both",
-        help=(
-            "Strategy for detecting single-turn conversations. "
-            "turn_column uses turn == 1. "
-            "user_message_count uses exactly one user message. "
-            "both requires both conditions."
-        ),
-    )
-
-    parser.add_argument(
-        "--duplicate-strategy",
-        choices=["exact", "fuzzy"],
-        default="exact",
-        help=(
-            "Duplicate detection strategy. "
-            "exact uses the exact first-prompt hash. "
-            "fuzzy first applies exact grouping, then MinHash+LSH and RapidFuzz "
-            "on normalized prompt prefixes, followed by a final blocking cleanup."
-        ),
-    )
-    parser.add_argument(
-        "--duplicate-mode",
-        choices=["none", "keep_first", "drop_all"],
-        default="drop_all",
-        help=(
-            "How to handle duplicate first user prompts after other filters. "
-            "none: keep duplicates. "
-            "keep_first: keep one representative occurrence. "
-            "drop_all: remove all rows belonging to duplicated prompt groups."
-        ),
-    )
-    parser.add_argument(
-        "--fuzzy-prefix-chars",
-        type=int,
-        default=DEFAULT_FUZZY_PREFIX_CHARS,
-        help=(
-            "Number of normalized first-prompt characters used for the primary "
-            "MinHash/LSH fuzzy deduplication round. "
-            f"Default: {DEFAULT_FUZZY_PREFIX_CHARS}."
-        ),
-    )
-    parser.add_argument(
-        "--fuzzy-threshold",
-        type=float,
-        default=DEFAULT_FUZZY_THRESHOLD,
-        help=(
-            "RapidFuzz WRatio threshold used after candidate generation. "
-            f"Default: {DEFAULT_FUZZY_THRESHOLD}."
-        ),
-    )
-
-    parser.add_argument(
-        "--drop-empty-first-prompt",
-        action="store_true",
-        help="Remove records whose first user prompt is empty.",
-    )
-
-    parser.add_argument(
-        "--rows-per-output-file",
-        type=int,
-        default=10_000,
-        help="Number of rows per output parquet shard.",
-    )
-
-    parser.add_argument(
-        "--max-files",
-        type=int,
-        default=None,
-        help="Optional maximum number of input parquet files to scan, useful for tests.",
-    )
-    parser.add_argument(
-        "--max-rows-per-file",
-        type=int,
-        default=None,
-        help="Optional maximum rows per input parquet file, useful for tests.",
-    )
-
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite output directory if it already contains parquet files.",
-    )
-
-    args = parser.parse_args()
+    print_configuration()
 
     english_labels = {
         normalize_language_label(label)
-        for label in args.english_labels.split(",")
-        if label.strip()
+        for label in ENGLISH_LABELS
+        if str(label).strip()
     }
 
-    clean_output_dir(args.output_dir, overwrite=args.overwrite)
+    clean_output_dir(
+        output_dir=FILTERED_DATASET_DIR,
+        overwrite=OVERWRITE_OUTPUTS,
+    )
 
     print("Collecting metadata...")
     metadata = collect_metadata(
-        input_dir=args.input_dir,
+        input_dir=RAW_DATASET_DIR,
         english_labels=english_labels,
-        single_turn_method=args.single_turn_method,
-        fuzzy_prefix_chars=args.fuzzy_prefix_chars,
-        max_files=args.max_files,
-        max_rows_per_file=args.max_rows_per_file,
+        single_turn_method=SINGLE_TURN_METHOD,
+        fuzzy_prefix_chars=FUZZY_PREFIX_CHARS,
+        max_files=MAX_FILES,
+        max_rows_per_file=MAX_ROWS_PER_FILE,
     )
 
     print("Applying filters...")
     filtered_metadata = apply_filters_to_metadata(
         metadata=metadata,
-        filter_non_english=args.filter_non_english,
-        filter_multiturn=args.filter_multiturn,
-        duplicate_strategy=args.duplicate_strategy,
-        duplicate_mode=args.duplicate_mode,
-        drop_empty_first_prompt=args.drop_empty_first_prompt,
-        fuzzy_threshold=args.fuzzy_threshold,
+        filter_non_english=FILTER_NON_ENGLISH,
+        filter_multiturn=FILTER_MULTITURN,
+        duplicate_strategy=DUPLICATE_STRATEGY,
+        duplicate_mode=DUPLICATE_MODE,
+        drop_empty_first_prompt=DROP_EMPTY_FIRST_PROMPT,
+        fuzzy_threshold=FUZZY_THRESHOLD,
     )
 
     print("\nFiltering summary")
@@ -1932,19 +1854,18 @@ def main() -> None:
 
     print("\nWriting filtered parquet shards...")
     write_filtered_parquet_shards(
-        input_dir=args.input_dir,
-        output_dir=args.output_dir,
+        input_dir=RAW_DATASET_DIR,
+        output_dir=FILTERED_DATASET_DIR,
         filtered_metadata=filtered_metadata,
-        rows_per_output_file=args.rows_per_output_file,
-        max_files=args.max_files,
-        max_rows_per_file=args.max_rows_per_file,
+        rows_per_output_file=ROWS_PER_OUTPUT_FILE,
+        max_files=MAX_FILES,
+        max_rows_per_file=MAX_ROWS_PER_FILE,
     )
 
     print("\nSaving reports...")
     save_reports(
-        report_dir=args.report_dir,
+        report_dir=FILTER_REPORT_DIR,
         filtered_metadata=filtered_metadata,
-        args=args,
     )
 
     print("\nDone.")

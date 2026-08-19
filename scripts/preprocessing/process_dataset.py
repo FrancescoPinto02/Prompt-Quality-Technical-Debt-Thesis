@@ -1,4 +1,3 @@
-import argparse
 import json
 import os
 import re
@@ -14,18 +13,32 @@ from tqdm import tqdm
 
 
 # ============================================================
-# Internal configuration
+# Configuration
 # ============================================================
 
-CODE_NL_PROMPT_PATH = Path("prompt/gpt-5_4-nano/CodeNLSeparation.txt")
-TASK_LANG_PROMPT_PATH = Path("prompt/gpt-5_4-nano/LangAndTaskClassification.txt")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+FILTERED_DATASET_DIR = PROJECT_ROOT / "data/filtered"
+PROCESSING_OUTPUT_DIR = PROJECT_ROOT / "data/processed/v1"
+
+CODE_NL_PROMPT_PATH = PROJECT_ROOT / "prompt/preprocessing/CodeNLSeparation.txt"
+LANGUAGE_PROMPT_PATH = PROJECT_ROOT / "prompt/preprocessing/LanguageClassification.txt"
+
+API_BASE = "http://localhost:1234/v1"
+API_KEY = os.getenv("OPENAI_API_KEY")
+MODEL = "local-model"
+
+TARGET_FILE: Optional[str] = None
+MAX_ROWS: Optional[int] = None
+WORKERS = 1
+MAX_BAD_RECORDS: Optional[int] = None
+OVERWRITE_OUTPUTS = False
 
 LINE_BATCH_SIZE = 15
 RETRIES = 2
 REQUEST_TIMEOUT = 300
 MAX_EXTRA_CLASSIFICATIONS_TO_REPAIR = 3
 
-SAFE_REPAIRED_STATUS = "ok_repaired"
 
 # ============================================================
 # Constants
@@ -37,31 +50,7 @@ COMPACT_TO_FULL_LINE_LABEL = {
 }
 
 VALID_COMPACT_LINE_LABELS = set(COMPACT_TO_FULL_LINE_LABEL.keys())
-
-VALID_TASK_CATEGORIES = {
-    "CODE_GENERATION",
-    "CODE_MODIFICATION",
-    "BUG_FIXING",
-    "REFACTORING",
-    "TEST_GENERATION",
-    "EXPLANATION",
-    "CONFIGURATION",
-    "DATA_QUERY",
-    "OTHER",
-    "AMBIGUOUS",
-}
-
-CODE_PRODUCING_TASKS = {
-    "CODE_GENERATION",
-    "CODE_MODIFICATION",
-    "BUG_FIXING",
-    "REFACTORING",
-    "TEST_GENERATION",
-    "CONFIGURATION",
-    "DATA_QUERY",
-}
-
-SPECIAL_LANGUAGE_CODES = {"UNKNOWN", "MIXED"}
+SPECIAL_LANGUAGE_CODES = {"UNKNOWN"}
 
 
 # ============================================================
@@ -69,6 +58,8 @@ SPECIAL_LANGUAGE_CODES = {"UNKNOWN", "MIXED"}
 # ============================================================
 
 def load_text_file(path: Path) -> str:
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt file not found: {path}")
     return path.read_text(encoding="utf-8").strip()
 
 
@@ -101,6 +92,24 @@ def safe_json_serializable(value: Any) -> Any:
         return value
 
     return str(value)
+
+
+def try_repair_missing_l_closing_bracket(text: str) -> Optional[str]:
+    """
+    Repairs a common malformed output:
+    {"l":[[1,"N"],[2,"C"]}
+    into:
+    {"l":[[1,"N"],[2,"C"]]}
+    """
+    candidate = text.strip()
+
+    if not candidate.startswith('{"l":'):
+        return None
+
+    if candidate.endswith("]}"):
+        return candidate[:-1] + "]}"
+
+    return None
 
 
 def extract_json_object(text: str) -> Dict[str, Any]:
@@ -139,15 +148,17 @@ def extract_json_object(text: str) -> Dict[str, Any]:
 
 
 def write_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
         f.flush()
 
 
 def load_processed_keys(output_path: Path) -> Set[str]:
-    processed = set()
+    processed: Set[str] = set()
 
-    if not output_path.exists():
+    if OVERWRITE_OUTPUTS or not output_path.exists():
         return processed
 
     with output_path.open("r", encoding="utf-8") as f:
@@ -161,6 +172,11 @@ def load_processed_keys(output_path: Path) -> Set[str]:
                 continue
 
     return processed
+
+
+def clean_output_path(output_path: Path) -> None:
+    if OVERWRITE_OUTPUTS and output_path.exists():
+        output_path.unlink()
 
 
 def get_processing_key(parquet_name: str, row_index: Any, row: pd.Series) -> str:
@@ -289,15 +305,10 @@ def call_chat_completion(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    payload = build_chat_payload(
-        model=model,
-        prompt=prompt,
-    )
-
     response = requests.post(
         url,
         headers=headers,
-        json=payload,
+        json=build_chat_payload(model=model, prompt=prompt),
         timeout=REQUEST_TIMEOUT,
     )
 
@@ -393,25 +404,6 @@ def build_code_nl_prompt(
     )
 
 
-def try_repair_missing_l_closing_bracket(text: str) -> Optional[str]:
-    """
-    Repairs a common malformed output:
-    {"l":[[1,"N"],[2,"C"]}
-    into:
-    {"l":[[1,"N"],[2,"C"]]}
-    """
-    candidate = text.strip()
-
-    if not candidate.startswith('{"l":'):
-        return None
-
-    if candidate.endswith("]}"):
-        repaired = candidate[:-1] + "]}"
-        return repaired
-
-    return None
-
-
 def normalize_compact_label(label: Any) -> str:
     compact_label = str(label).strip().upper()
 
@@ -432,8 +424,6 @@ def try_repair_extra_code_nl_rows(
     Safe repairs:
     - discard trailing/out-of-range rows, e.g. line_id 16 when expected 1..15;
     - discard duplicated rows only if the duplicate has the same label.
-
-    It does NOT repair missing expected ids or conflicting duplicate labels.
     """
     if len(rows) <= expected_count:
         return rows
@@ -448,9 +438,6 @@ def try_repair_extra_code_nl_rows(
     expected_ids = list(range(1, expected_count + 1))
     expected_id_set = set(expected_ids)
 
-    # Very common case:
-    # [[1,"N"], ... [15,"C"], [16,"C"]]
-    # If the first N rows are exactly 1...N, keep them and discard the rest.
     try:
         first_ids = [int(item[0]) for item in rows[:expected_count]]
         if first_ids == expected_ids:
@@ -470,8 +457,6 @@ def try_repair_extra_code_nl_rows(
         except Exception:
             raise ValueError(f"Invalid relative line_id: {item[0]}")
 
-        # Extra out-of-range row, e.g. 16 when expected 1..15.
-        # Safe to ignore.
         if relative_id not in expected_id_set:
             continue
 
@@ -482,11 +467,9 @@ def try_repair_extra_code_nl_rows(
             kept_labels_by_id[relative_id] = compact_label
             continue
 
-        # Duplicate same id with same label: safe to ignore.
         if kept_labels_by_id[relative_id] == compact_label:
             continue
 
-        # Duplicate same id with conflicting label: unsafe.
         raise ValueError(
             f"Conflicting duplicate classification for relative line_id {relative_id}: "
             f"{kept_labels_by_id[relative_id]} vs {compact_label}"
@@ -515,8 +498,6 @@ def validate_code_nl_output(
 
     Expected output:
         {"l":[[1,"N"],[2,"C"],[3,"N"]]}
-
-    Returned result uses original prompt line numbers internally.
     """
     if "l" not in obj:
         raise ValueError("Missing field: l")
@@ -600,9 +581,7 @@ def classify_line_batch(
     model: str,
     api_key: Optional[str],
 ) -> Dict[str, Any]:
-    expected_line_numbers = {int(line_number) for line_number, _ in line_batch}
     prompt = build_code_nl_prompt(prompt_template, line_batch)
-
     raw_response = None
 
     try:
@@ -633,7 +612,7 @@ def classify_line_batch(
         for line_number, text in line_batch:
             print(f"{line_number}: {text}")
         print("Raw response:")
-        print(raw_response if "raw_response" in locals() else None)
+        print(raw_response)
         print()
 
         return {
@@ -685,16 +664,6 @@ def infer_missing_line_label_from_neighbors(
     original_lines: List[str],
     classifications: List[Dict[str, Any]],
 ) -> str:
-    """
-    Infers the label for a missing line using its nearest classified neighbors.
-
-    If the closest previous classified non-empty line and the closest next
-    classified non-empty line have the same label, return that label.
-
-    Otherwise:
-    - empty / whitespace-only line -> EMPTY
-    - non-empty line -> NATURAL_LANGUAGE
-    """
     line_text = original_lines[line_number - 1]
 
     if not line_text.strip():
@@ -708,7 +677,6 @@ def infer_missing_line_label_from_neighbors(
     previous_label = None
     next_label = None
 
-    # Look backward for the nearest classified non-empty line.
     for previous_line_number in range(line_number - 1, 0, -1):
         previous_line_text = original_lines[previous_line_number - 1]
 
@@ -719,7 +687,6 @@ def infer_missing_line_label_from_neighbors(
             previous_label = label_by_line[previous_line_number]
             break
 
-    # Look forward for the nearest classified non-empty line.
     for next_line_number in range(line_number + 1, len(original_lines) + 1):
         next_line_text = original_lines[next_line_number - 1]
 
@@ -787,11 +754,6 @@ def separate_prompt_code_nl(
 
         if result["status"] == "ok":
             all_classifications.extend(result["classifications"])
-
-        elif result["status"] == "ok_repaired":
-            all_classifications.extend(result["classifications"])
-            repairs.append(result.get("repair_note", "batch repaired"))
-
         else:
             errors.append(result["error"])
 
@@ -846,10 +808,10 @@ def separate_prompt_code_nl(
 
 
 # ============================================================
-# Step 2: Task + Language classification
+# Step 2: Language classification
 # ============================================================
 
-def build_task_lang_prompt(
+def build_language_prompt(
     prompt_template: str,
     natural_language_text: str,
     contains_code: bool,
@@ -871,30 +833,21 @@ def build_task_lang_prompt(
     )
 
 
-def validate_task_lang_output(obj: Dict[str, Any]) -> Dict[str, Any]:
-    if "t" not in obj:
-        raise ValueError("Missing field: t")
-
+def validate_language_output(obj: Dict[str, Any]) -> Dict[str, Any]:
     if "l" not in obj:
         raise ValueError("Missing field: l")
 
-    task_category = str(obj["t"]).strip().upper()
-    detected_language = str(obj["l"]).strip().upper()
+    prompt_language = str(obj["l"]).strip().upper()
 
-    if task_category not in VALID_TASK_CATEGORIES:
-        raise ValueError(f"Invalid task category: {task_category}")
-
-    if not is_valid_language_code(detected_language):
-        raise ValueError(f"Invalid language code: {detected_language}")
+    if not is_valid_language_code(prompt_language):
+        raise ValueError(f"Invalid language code: {prompt_language}")
 
     return {
-        "task_category": task_category,
-        "detected_language": detected_language,
-        "is_code_generation": task_category in CODE_PRODUCING_TASKS,
+        "prompt_language": prompt_language,
     }
 
 
-def classify_task_and_language(
+def classify_language(
     natural_language_text: str,
     contains_code: bool,
     code_line_count: int,
@@ -903,7 +856,14 @@ def classify_task_and_language(
     model: str,
     api_key: Optional[str],
 ) -> Dict[str, Any]:
-    prompt = build_task_lang_prompt(
+    if not natural_language_text.strip():
+        return {
+            "prompt_language": "UNKNOWN",
+            "language_status": "empty_text",
+            "language_error": None,
+        }
+
+    prompt = build_language_prompt(
         prompt_template=prompt_template,
         natural_language_text=natural_language_text,
         contains_code=contains_code,
@@ -919,21 +879,19 @@ def classify_task_and_language(
         )
 
         parsed = extract_json_object(raw_response)
-        classification = validate_task_lang_output(parsed)
+        classification = validate_language_output(parsed)
 
         return {
             **classification,
-            "task_lang_status": "ok",
-            "task_lang_error": None,
+            "language_status": "ok",
+            "language_error": None,
         }
 
     except Exception as exc:
         return {
-            "task_category": None,
-            "detected_language": None,
-            "is_code_generation": None,
-            "task_lang_status": "error",
-            "task_lang_error": str(exc),
+            "prompt_language": None,
+            "language_status": "error",
+            "language_error": str(exc),
         }
 
 
@@ -946,7 +904,7 @@ def process_single_record(
     row_index: Any,
     row: pd.Series,
     code_nl_prompt_template: str,
-    task_lang_prompt_template: str,
+    language_prompt_template: str,
     api_base: str,
     model: str,
     api_key: Optional[str],
@@ -971,11 +929,11 @@ def process_single_record(
         api_key=api_key,
     )
 
-    task_lang = classify_task_and_language(
+    language = classify_language(
         natural_language_text=separation["natural_language_text"],
         contains_code=separation["contains_code"],
         code_line_count=separation["code_line_count"],
-        prompt_template=task_lang_prompt_template,
+        prompt_template=language_prompt_template,
         api_base=api_base,
         model=model,
         api_key=api_key,
@@ -986,8 +944,8 @@ def process_single_record(
     if separation["code_nl_status"] not in {"ok", "ok_repaired", "empty_prompt"}:
         errors.append(f"code_nl: {separation['code_nl_error']}")
 
-    if task_lang["task_lang_status"] != "ok":
-        errors.append(f"task_lang: {task_lang['task_lang_error']}")
+    if language["language_status"] == "error":
+        errors.append(f"language: {language['language_error']}")
 
     if separation["code_nl_status"] == "empty_prompt":
         overall_status = "empty_prompt"
@@ -1007,12 +965,10 @@ def process_single_record(
         "code_text": separation["code_text"],
         "contains_code": separation["contains_code"],
 
-        "task_category": task_lang["task_category"],
-        "is_code_generation": task_lang["is_code_generation"],
-        "detected_language": task_lang["detected_language"],
+        "prompt_language": language["prompt_language"],
 
         "code_nl_status": separation["code_nl_status"],
-        "task_lang_status": task_lang["task_lang_status"],
+        "language_status": language["language_status"],
         "overall_status": overall_status,
         "overall_error": " | ".join(errors) if errors else None,
     }
@@ -1026,7 +982,7 @@ def process_parquet_file(
     parquet_path: Path,
     output_path: Path,
     code_nl_prompt_template: str,
-    task_lang_prompt_template: str,
+    language_prompt_template: str,
     api_base: str,
     model: str,
     api_key: Optional[str],
@@ -1042,6 +998,7 @@ def process_parquet_file(
         df = df.head(max_rows)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    clean_output_path(output_path)
 
     processed_keys = load_processed_keys(output_path)
     rows_to_process = []
@@ -1084,7 +1041,6 @@ def process_parquet_file(
                     f"{bad_records} > {max_bad_records}"
                 )
 
-
     write_lock = Lock()
 
     if workers <= 1:
@@ -1094,7 +1050,7 @@ def process_parquet_file(
                 row_index=row_index,
                 row=row,
                 code_nl_prompt_template=code_nl_prompt_template,
-                task_lang_prompt_template=task_lang_prompt_template,
+                language_prompt_template=language_prompt_template,
                 api_base=api_base,
                 model=model,
                 api_key=api_key,
@@ -1113,7 +1069,7 @@ def process_parquet_file(
                 row_index,
                 row,
                 code_nl_prompt_template,
-                task_lang_prompt_template,
+                language_prompt_template,
                 api_base,
                 model,
                 api_key,
@@ -1136,121 +1092,58 @@ def process_parquet_file(
 
 
 # ============================================================
-# CLI
+# Main
 # ============================================================
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Process filtered parquet records with LLM-based code/NL separation "
-            "and compact task/language classification."
-        )
-    )
-
-    parser.add_argument(
-        "--input-dir",
-        type=Path,
-        default=Path("data/filtered"),
-        help="Directory containing filtered parquet files.",
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("data/processed"),
-        help="Directory where JSONL outputs will be written.",
-    )
-
-    parser.add_argument(
-        "--api-base",
-        type=str,
-        default="http://localhost:1234/v1",
-        help="LM Studio: http://localhost:1234/v1 | OpenAI: https://api.openai.com/v1",
-    )
-
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        default=None,
-        help="Optional. If omitted, OPENAI_API_KEY is used when available.",
-    )
-
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="Model name exposed by LM Studio or OpenAI.",
-    )
-
-    parser.add_argument(
-        "--file",
-        type=str,
-        default=None,
-        help="Optional single parquet filename to process.",
-    )
-
-    parser.add_argument(
-        "--max-rows",
-        type=int,
-        default=None,
-        help="Optional maximum rows per parquet file. Useful for testing.",
-    )
-
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="Number of records to process in parallel.",
-    )
-
-    parser.add_argument(
-        "--max-bad-records",
-        type=int,
-        default=None,
-        help=(
-            "Stop processing when the number of records with overall_status "
-            "partial_error or error exceeds this value. "
-            "Default: disabled."
-        ),
-    )
-
-    args = parser.parse_args()
-
-    api_key = args.api_key or os.getenv("OPENAI_API_KEY")
-
-    code_nl_prompt_template = load_text_file(CODE_NL_PROMPT_PATH)
-    task_lang_prompt_template = load_text_file(TASK_LANG_PROMPT_PATH)
-
-    if args.file:
-        parquet_files = [args.input_dir / args.file]
+def get_parquet_files() -> List[Path]:
+    if TARGET_FILE is not None:
+        parquet_files = [FILTERED_DATASET_DIR / TARGET_FILE]
     else:
-        parquet_files = sorted(args.input_dir.glob("*.parquet"))
+        parquet_files = sorted(FILTERED_DATASET_DIR.glob("*.parquet"))
 
     if not parquet_files:
-        raise FileNotFoundError(f"No parquet files found in {args.input_dir}")
+        raise FileNotFoundError(f"No parquet files found in {FILTERED_DATASET_DIR}")
+
+    for parquet_file in parquet_files:
+        if not parquet_file.exists():
+            raise FileNotFoundError(f"Parquet file not found: {parquet_file}")
+
+    return parquet_files
+
+
+def main() -> None:
+    PROCESSING_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    code_nl_prompt_template = load_text_file(CODE_NL_PROMPT_PATH)
+    language_prompt_template = load_text_file(LANGUAGE_PROMPT_PATH)
+
+    parquet_files = get_parquet_files()
 
     print(f"Files to process: {len(parquet_files)}")
-
     for parquet_file in parquet_files:
         print(f" - {parquet_file.name}")
 
-    for parquet_path in parquet_files:
-        if not parquet_path.exists():
-            raise FileNotFoundError(f"Parquet file not found: {parquet_path}")
+    print()
+    print(f"Input directory: {FILTERED_DATASET_DIR}")
+    print(f"Output directory: {PROCESSING_OUTPUT_DIR}")
+    print(f"API base: {API_BASE}")
+    print(f"Model: {MODEL}")
+    print(f"Workers: {WORKERS}")
 
-        output_path = args.output_dir / f"{parquet_path.stem}.jsonl"
+    for parquet_path in parquet_files:
+        output_path = PROCESSING_OUTPUT_DIR / f"{parquet_path.stem}.jsonl"
 
         process_parquet_file(
             parquet_path=parquet_path,
             output_path=output_path,
             code_nl_prompt_template=code_nl_prompt_template,
-            task_lang_prompt_template=task_lang_prompt_template,
-            api_base=args.api_base,
-            model=args.model,
-            api_key=api_key,
-            max_rows=args.max_rows,
-            workers=args.workers,
-            max_bad_records=args.max_bad_records,
+            language_prompt_template=language_prompt_template,
+            api_base=API_BASE,
+            model=MODEL,
+            api_key=API_KEY,
+            max_rows=MAX_ROWS,
+            workers=WORKERS,
+            max_bad_records=MAX_BAD_RECORDS,
         )
 
     print("\nProcessing completed.")

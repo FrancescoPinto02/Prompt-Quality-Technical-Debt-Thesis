@@ -226,7 +226,7 @@ def extract_prompt_parts_from_row(row: pd.Series) -> Tuple[str, str]:
     """
     Supports both dataset formats:
 
-    v2 format:
+    v1 format:
     - natural_language_text
     - code_text
 

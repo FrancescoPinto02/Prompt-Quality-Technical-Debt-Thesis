@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
 from tqdm import tqdm
@@ -77,34 +78,18 @@ VALID_TASKS: Set[str] = {
 # Prompt
 # ============================================================
 
-SYSTEM_PROMPT = """
-##### SYSTEM #####
-You are an expert annotator for an empirical software engineering study.
-Your task is to classify developer prompts sent to LLMs based on the requested task.
-You must assign exactly one task category based on the user's primary intent.
-Return only valid JSON. Do not include explanations, markdown, comments, or extra text.
+PROMPT_DIR = PROJECT_ROOT / "prompt" / "intent_classification"
+TASK_SYSTEM_PROMPT_PATH = PROMPT_DIR / "TaskClassificationSystemPrompt.txt"
 
-##### TASK #####
-Classify the given user prompt into exactly one of the following categories:
-1-CODE_GENERATION: The user asks the LLM to create new code from a description, requirement, or context.
-2-CODE_MODIFICATION: The user asks the LLM to modify, refactor, optimize or migrate existing code.
-3-EXPLANATION: The user asks for knowledge, clarification, conceptual explanation, step-by-step guidance, tool/framework explanation, explanation about code behavior or conceptual explanation about errors.
-4-ISSUE_RESOLVING: The user asks a concrete fix of an error, bug, exception, warning or unexpected behavior inside the code.
-5-CODE_REVIEW: The user asks the LLM to evaluate or suggest conceptual improvements for code, or to compare different implementation or design choices.
-6-DATA_PROCESSING: The user asks to analyze data, generate data or transform given data in a different format.
-7-DOCUMENTATION: The user asks to create, improve, review, translate, or refine technical documentation like comments, README files or docstrings.
-8-OTHER: The prompt is ambiguous, non-software-related, or does not fit any category above.
 
-##### OUTPUT FORMAT #####
-Return only this JSON object:
-{"task":"CATEGORY"}
+def load_text_file(path: Path) -> str:
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt file not found: {path}")
 
-##### EXAMPLE #####
-Input:
-Write a Python function that checks whether a string is a palindrome.
-Output:
-{"task":"CODE_GENERATION"}
-""".strip()
+    return path.read_text(encoding="utf-8").strip()
+
+
+SYSTEM_PROMPT = load_text_file(TASK_SYSTEM_PROMPT_PATH)
 
 
 # ============================================================

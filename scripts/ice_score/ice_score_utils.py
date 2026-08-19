@@ -13,10 +13,25 @@ from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+ICE_PROMPT_DIR = PROJECT_ROOT / "prompt" / "ice_score"
+ICE_CORRECTNESS_SYSTEM_PROMPT_PATH = ICE_PROMPT_DIR / "ICECorrectnessSystemPrompt.txt"
+ICE_USEFULNESS_SYSTEM_PROMPT_PATH = ICE_PROMPT_DIR / "ICEUsefulnessSystemPrompt.txt"
+
+ICE_SYSTEM_PROMPT_PATHS = {
+    "correctness": ICE_CORRECTNESS_SYSTEM_PROMPT_PATH,
+    "usefulness": ICE_USEFULNESS_SYSTEM_PROMPT_PATH,
+}
+
 
 # ============================================================
 # Basic utilities
 # ============================================================
+
+def load_text_file(path: Path) -> str:
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt file not found: {path}")
+
+    return path.read_text(encoding="utf-8").strip()
 
 def safe_text(value: Any) -> str:
     if value is None:
@@ -206,60 +221,14 @@ def format_code_blocks_for_ice(code_blocks: List[str]) -> str:
 
 def build_ice_system_prompt(aspect: str) -> str:
     """
-    Builds the system prompt containing:
-    task definition, evaluation criteria, evaluation steps, and output format.
+    Loads the ICE system prompt for the selected aspect from a TXT file.
     """
-    if aspect == "correctness":
-        return """\
-##### TASK #####
-You will be given the code snippet for a problem. 
-Your task is to rate the code snippet only on one metric.
-Please make sure you read and understand these instructions carefully.
-Please keep this document open while reviewing, and refer to it as needed.
+    aspect = safe_text(aspect).strip().lower()
 
-##### EVALUATION CRITERIA #####
-Functional Correctness (0-4) - Execution-based quality of the code snippet combined with the problem. The correctness is measured by the all possible unit tests, and the comparison of the reference code. The combination of the code snippet and the problem should pass all the possible tests based on your understanding of the reference code. The length of the code snippet can not determine the correctness. You need to assess the logics line by line.
-- A score of 0  (failing all possible test) means that the code snippet is totally incorrect and meaningless.
-- A score of 4  (passing all possible test) means that the code snippet is totally correct and can handle all cases.
+    if aspect not in ICE_SYSTEM_PROMPT_PATHS:
+        raise ValueError(f"Unknown ICE aspect: {aspect}")
 
-##### EVALUATION STEPS #####
-1. Read the problem carefully and identify required functionalities of the implementation.
-2. Read the code snippet and compare it to the problem. Check if the code snippet covers all required functionalities of the problem. 
-3. Assign a score for functional correctness on a scale of 0 to 4, where 0 is the lowest and 4 is the highest based on the Evaluation Criteria.
-
-##### OUTPUT FORMAT #####
-Return only a valid JSON object with this exact structure:
-{"score": score}
-""".strip()
-
-    if aspect == "usefulness":
-        return """\
-##### TASK #####
-You will be given the code snippet for a problem.
-Your task is to rate the code snippet only on one metric.
-Please make sure you read and understand these instructions carefully.
-Please keep this document open while reviewing, and refer to it as needed.
-
-##### EVALUATION CRITERIA #####
-Usefulness (0-4) Usefulness of the code snippet based on the problem description.
-
-- A score of 0: Snippet is not at all helpful, it is irrelevant to the problem.
-- A score of 1: Snippet is slightly helpful, it contains information relevant to the problem, but it is easier to write the solution from scratch.
-- A score of 2: Snippet is somewhat helpful, it requires significant changes (compared to the size of the snippet), but is still useful.
-- A score of 3: Snippet is helpful, but needs to be slightly changed to solve the problem.
-- A score of 4: Snippet is very helpful, it solves the problem.
-
-##### EVALUATION STEPS #####
-1. Read the problem carefully and identify required functionalities of the implementation.
-2. Read the code snippet and compare it to the problem. Check if the code snippet covers all required functionalities of the problem, and if it presents them in a clear and logical order. 
-3. Assign a score for usefulness on a scale of 0 to 4, where 0 is the lowest and 4 is the highest based on the Evaluation Criteria.
-
-##### OUTPUT FORMAT #####
-Return only a valid JSON object with this exact structure:
-{"score": score}
-""".strip()
-
-    raise ValueError(f"Unknown ICE aspect: {aspect}")
+    return load_text_file(ICE_SYSTEM_PROMPT_PATHS[aspect])
 
 
 def build_ice_user_prompt(problem: str, output: str) -> str:
